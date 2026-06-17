@@ -28,29 +28,30 @@ namespace pto {
 // - exp_max and global_sum are per-row reduced tiles (shape [S0, 1]) that get broadcast over columns.
 // -----------------------------------------------------------------------------
 
-template <typename reducedTileData, typename svTileData>
+template <typename reducedTileData, typename svTileData, typename tmpTileData>
 AICORE inline void pto_macro_fa_gu(svTileData __out__ prev_sv_tile, svTileData __in__ est_sv_tile,
-                                   reducedTileData __in__ exp_max)
+                                   reducedTileData __in__ exp_max, tmpTileData __out__ tmp)
 {
-    pto::TROWEXPANDMUL(prev_sv_tile, prev_sv_tile, exp_max);
+    pto::TROWEXPANDMUL(prev_sv_tile, prev_sv_tile, exp_max, tmp);
     pto::TADD(prev_sv_tile, prev_sv_tile, est_sv_tile);
 }
 
-template <typename reducedTileData, typename svTileData>
+template <typename reducedTileData, typename svTileData, typename tmpTileData>
 AICORE inline void pto_macro_fa_gu_last(svTileData __out__ prev_sv_tile, svTileData __in__ est_sv_tile,
-                                        reducedTileData __in__ exp_max, reducedTileData __in__ new_global_sum)
+                                        reducedTileData __in__ exp_max, reducedTileData __in__ new_global_sum,
+                                        tmpTileData __out__ tmp)
 {
-    pto::TROWEXPANDMUL(prev_sv_tile, prev_sv_tile, exp_max);
+    pto::TROWEXPANDMUL(prev_sv_tile, prev_sv_tile, exp_max, tmp);
     pto::TADD(prev_sv_tile, prev_sv_tile, est_sv_tile);
-    pto::TROWEXPANDDIV(prev_sv_tile, prev_sv_tile, new_global_sum);
+    pto::TROWEXPANDDIV(prev_sv_tile, prev_sv_tile, new_global_sum, tmp);
     // pto::TCVT(prev_sv_nd_tile, prev_sv_tile, RoundMode::CAST_RINT);
 }
 
-template <typename reducedTileData, typename svTileData>
+template <typename reducedTileData, typename svTileData, typename tmpTileData>
 AICORE inline void pto_macro_fa_gu_single_and_last_tile(svTileData __out__ sv_tile,
-                                                        reducedTileData __in__ new_global_sum)
+                                                        reducedTileData __in__ new_global_sum, tmpTileData __out__ tmp)
 {
-    pto::TROWEXPANDDIV(sv_tile, sv_tile, new_global_sum);
+    pto::TROWEXPANDDIV(sv_tile, sv_tile, new_global_sum, tmp);
 }
 
 } // namespace pto

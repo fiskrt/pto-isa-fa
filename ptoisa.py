@@ -62,8 +62,6 @@ def main() -> None:
 
     flash = jit_compile_flash(
         head_size=head_size,
-        s0=q_len,
-        s1=s_len,
         cube_s0=args.cube_s0,
         tile_s1=args.tile_s1,
         qk_preload=args.qk_preload,

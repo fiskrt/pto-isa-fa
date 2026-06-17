@@ -63,21 +63,20 @@ AICORE inline void softmax_opt_fa_init_impl(TileDataD2 __out__ x_exp, TileDataS1
     Tile1D_fp32 p_tile_f32_1d;
     Tile1D_out x_exp_1d;
     if constexpr (CAUSAL_MASK) {
-        if (s0_index / TileDataS1::Cols == s1_index / TileDataS1::Cols) {
-            constexpr float negInf = -3.40282e+38;
-            TTRI<TileDataS1, 1>(triu, 1 + (s0_index % TileDataS1::Cols));
+        constexpr float negInf = -3.40282e+38;
+        const int diagonal = s0_index - s1_index + 1;
+        TTRI<TileDataS1, 1>(triu, diagonal);
 #if defined(__DAV_C220_VEC__)
-            pipe_barrier(PIPE_V);
+        pipe_barrier(PIPE_V);
 #endif
-            TMULS(triu, triu, negInf);
+        TMULS(triu, triu, negInf);
 #if defined(__DAV_C220_VEC__)
-            pipe_barrier(PIPE_V);
+        pipe_barrier(PIPE_V);
 #endif
-            TADD(input_x, input_x, triu);
+        TADD(input_x, input_x, triu);
 #if defined(__DAV_C220_VEC__)
-            pipe_barrier(PIPE_V);
+        pipe_barrier(PIPE_V);
 #endif
-        }
     }
     // FA2.0 init mode
     TROWMAX(new_global_max, input_x, tmp_float);
@@ -122,21 +121,20 @@ AICORE inline void softmax_opt_fa_not_init_impl(TileDataD2 __out__ x_exp, TileDa
     Tile1D_out x_exp_1d;
 
     if constexpr (CAUSAL_MASK) {
-        if (s0_index / TileDataS1::Cols == s1_index / TileDataS1::Cols) {
-            constexpr float negInf = -3.40282e+38;
-            TTRI<TileDataS1, 1>(triu, 1 + (s0_index % TileDataS1::Cols));
+        constexpr float negInf = -3.40282e+38;
+        const int diagonal = s0_index - s1_index + 1;
+        TTRI<TileDataS1, 1>(triu, diagonal);
 #if defined(__DAV_C220_VEC__)
-            pipe_barrier(PIPE_V);
+        pipe_barrier(PIPE_V);
 #endif
-            TMULS(triu, triu, negInf);
+        TMULS(triu, triu, negInf);
 #if defined(__DAV_C220_VEC__)
-            pipe_barrier(PIPE_V);
+        pipe_barrier(PIPE_V);
 #endif
-            TADD(input_x, input_x, triu);
+        TADD(input_x, input_x, triu);
 #if defined(__DAV_C220_VEC__)
-            pipe_barrier(PIPE_V);
+        pipe_barrier(PIPE_V);
 #endif
-        }
     }
     // FA2.0 streaming mode (not first tile): update (global_max, global_sum) and rescale old sums.
     TROWMAX(local_max, input_x, tmp_float);

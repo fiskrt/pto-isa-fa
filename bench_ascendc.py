@@ -52,6 +52,9 @@ def op_time_us(out_dir, op_type):
 
 
 def profile(script, args, s, out_dir):
+    if args.event:
+        return event_time_us(args, s)
+
     b = batch_for_s(args, s)
     q = args.Q or s
     app = [sys.executable, script, "--B", b, "--Q", q, "--S", s, "--H", args.H, "--D", args.D, "--no-check"]
@@ -64,6 +67,47 @@ def profile(script, args, s, out_dir):
     cmd = ["msprof", f"--output={out_dir}", f"--application={shlex.join(map(str, app))}"]
     subprocess.run(cmd, check=True)
     return op_time_us(out_dir, args.op)
+
+
+def event_time_us(args, s):
+    import torch
+    import torch_npu
+
+    from utils.bench import do_bench
+
+    torch.set_default_device("npu")
+    torch.manual_seed(0)
+
+    b = batch_for_s(args, s)
+    q_len = int(args.Q or s)
+    s_len = s
+    q_heads = int(args.q_heads or args.H)
+    kv_heads = int(args.kv_heads or args.H)
+    head_size = int(args.D)
+
+    q = torch.randn(b, q_heads, q_len, head_size, dtype=torch.float16)
+    k = torch.randn(b, kv_heads, s_len, head_size, dtype=torch.float16)
+    v = torch.randn(b, kv_heads, s_len, head_size, dtype=torch.float16)
+    sm_scale = (1.0 / head_size) ** 0.5
+    atten_mask = torch.triu(torch.ones(2048, 2048, dtype=torch.bool), diagonal=1) if args.causal else None
+
+    def run_once():
+        torch_npu.npu_fusion_attention(
+            q,
+            k,
+            v,
+            q_heads,
+            padding_mask=None,
+            atten_mask=atten_mask,
+            scale=sm_scale,
+            keep_prob=1.0,
+            input_layout="BNSD",
+            pre_tockens=65535,
+            next_tockens=65535,
+            sparse_mode=3 if args.causal else 0,
+        )[0]
+
+    return float(do_bench(run_once))
 
 
 def plot(rows, path, args):
@@ -120,6 +164,7 @@ def main():
     p.add_argument("--causal", action="store_true")
     p.add_argument("--fixed-tokens", "--fixed-batch", action="store_true", dest="fixed_tokens")
     p.add_argument("--op", default="FlashAttentionScore")
+    p.add_argument("--event", action="store_true", help="use torch.npu.Event timing instead of msprof")
     p.add_argument("--log-dir", default="log")
     p.add_argument("--plot", default="npu_fusion_attention_msprof.png")
     p.add_argument("--bw-plot", default="npu_fusion_attention_bandwidth.png")
