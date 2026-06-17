@@ -560,7 +560,7 @@ AICORE inline void compute_gu(PVPipe &pvPipe, int tile_id, int num_tiles, __gm__
 
 template <int S0, int HEAD_SIZE, int S1, int CUBE_S0, int CUBE_S1, int TILE_S1, int QK_PRELOAD, int CV_FIFO_SIZE,
           bool INTERMEDIATE_CHECK, bool CAUSAL_MASK, int CV_FIFO_CONS_SYNC_PERIOD>
-__global__ AICORE void runTFA(__gm__ uint64_t *ffts_addr, __gm__ half *q, __gm__ half *k, __gm__ half *v,
+AICORE inline void runTFABody(__gm__ uint64_t *ffts_addr, __gm__ half *q, __gm__ half *k, __gm__ half *v,
                               __gm__ half *p_tile_fifo, __gm__ float *exp_max_ififo, __gm__ float *global_sum_out,
                               __gm__ float *exp_max_out, __gm__ float *o_out, __gm__ float *o_parts_out,
                               __gm__ float *qk_tile_fifo, __gm__ float *pv_tile_fifo, __gm__ uint8_t *cv_comm_buf,
@@ -874,20 +874,26 @@ __global__ AICORE void runTFA(__gm__ uint64_t *ffts_addr, __gm__ half *q, __gm__
     if (profile_entry != nullptr) {
         profile_entry[1] = tEnd;
     }
-#ifdef _DEBUG
-    if constexpr (DAV_CUBE) {
-        cce::printf("Core %d Cube Block %d, Start @%d End @%d (%d us)\n", get_coreid(), block_idx, int(tStart),
-                    int(tEnd), int(tEnd - tStart) * 20 / 1000);
-    } else {
-        cce::printf("Core %d Vec Block %d, SubBlock %d, Start @%d End @%d (%d us)\n", get_coreid(), block_idx,
-                    int(get_subblockid()), int(tStart), int(tEnd), int(tEnd - tStart) * 20 / 1000);
-    }
-#endif
 }
 
 // Empty kernel to warm up cores
 __global__ AICORE __attribute__((aic)) void warmup_kernel()
 {}
+
+template <int S0, int HEAD_SIZE, int S1, int CUBE_S0, int CUBE_S1, int TILE_S1, int QK_PRELOAD, int CV_FIFO_SIZE,
+          bool INTERMEDIATE_CHECK, bool CAUSAL_MASK, int CV_FIFO_CONS_SYNC_PERIOD>
+__global__ AICORE void runTFATemplate(__gm__ uint64_t *ffts_addr, __gm__ half *q, __gm__ half *k, __gm__ half *v,
+                                      __gm__ half *p_tile_fifo, __gm__ float *exp_max_ififo,
+                                      __gm__ float *global_sum_out, __gm__ float *exp_max_out,
+                                      __gm__ float *o_out, __gm__ float *o_parts_out,
+                                      __gm__ float *qk_tile_fifo, __gm__ float *pv_tile_fifo,
+                                      __gm__ uint8_t *cv_comm_buf, __gm__ uint8_t *profile_buf)
+{
+    runTFABody<S0, HEAD_SIZE, S1, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, CV_FIFO_SIZE, INTERMEDIATE_CHECK,
+               CAUSAL_MASK, CV_FIFO_CONS_SYNC_PERIOD>(ffts_addr, q, k, v, p_tile_fifo, exp_max_ififo, global_sum_out,
+                                                       exp_max_out, o_out, o_parts_out, qk_tile_fifo, pv_tile_fifo,
+                                                       cv_comm_buf, profile_buf);
+}
 
 template <int S0, int HEAD_SIZE, int S1, int CUBE_S0, int CUBE_S1, int TILE_S1, int QK_PRELOAD, int CV_FIFO_SIZE,
           bool INTERMEDIATE_CHECK, bool CAUSAL_MASK, int CV_FIFO_CONS_SYNC_PERIOD>
@@ -919,8 +925,8 @@ void LaunchTFA(uint16_t *ffts, aclFloat16 *q, aclFloat16 *k, aclFloat16 *v, aclF
     }
 #endif
 
-    runTFA<S0, HEAD_SIZE, S1, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, CV_FIFO_SIZE, INTERMEDIATE_CHECK, CAUSAL_MASK,
-           CV_FIFO_CONS_SYNC_PERIOD><<<block_rows, nullptr, stream>>>(
+    runTFATemplate<S0, HEAD_SIZE, S1, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, CV_FIFO_SIZE, INTERMEDIATE_CHECK,
+                   CAUSAL_MASK, CV_FIFO_CONS_SYNC_PERIOD><<<block_rows, nullptr, stream>>>(
         (__gm__ uint64_t *)ffts, (half *)q, (half *)k, (half *)v, (half *)p_tile_fifo, exp_max_ififo, global_sum_out,
         exp_max_out, o_out, o_parts_out, qk_tile_fifo, pv_tile_fifo, cv_comm_buf, profile_data);
 }

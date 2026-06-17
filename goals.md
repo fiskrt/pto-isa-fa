@@ -1,14 +1,17 @@
-The goal is to have a flash attention 2 like implementation in pto-isa. See 3p/pto-isa/ for which NPU ops are available.
+The goal is to have a flash attention 2 like implementation in pto-isa. See 3p/pto-isa/ for which NPU tile ops are available.
 
-The sourounding scaffolding should be miminal and simple, for example a short jit method, short set up and run verification benchmarks etc, just in a few LoC.
+The sourounding scaffolding should be minimal and very few LoC, we have:
+`python ptoisa.py --B 1 --Q 128 --S 1024 --H 1 --D 128 --force-jit --causal` for verification and
+`python bench_ptoisa.py --B 1 --Q 128 --S 1024 --H 1 --D 128 --force-jit --causal` for benchmarking.
+
+
 
 The flash attention 2 implementation in pto-isa should:
 
-1. Be divided into 4 clean steps where we calculate QKt
-2. 
+1. Be divided into clean steps where we calculate S=QKt, 
 
 
-where the goal is to have it run as fast as matrix multiplication, i.e. we must make sure that the online softmax runs in parallel while the cube cores are working on matrix multiplication.
+The goal is to have it run as fast as matrix multiplication, i.e. we must make sure that the online softmax runs in parallel while the cube cores are working on matrix multiplication.
 
 Another very import aspect is load balancing:
 
@@ -24,6 +27,6 @@ But this case might only be relevent for longer seqences as S0_tile is going to 
 To extend this loadbalancing to cases where it's not a perfect multiple, we can do the same assigning bottom and top rows and the just do round robin for the middle rows that are left over. This is not so bad since the rows close to the middle will be more similar in length than row 0 and row n-1 for example.
 
 
-### case 2: decoding so n_0=1 or S0=1
+### case 2: decoding so n_0=1 or S0=1 (Future work)
 
 Might have to do load balancing in the S1 dimension aswell, but this requires keeping track of LSE and some more work. But this is for future work.
