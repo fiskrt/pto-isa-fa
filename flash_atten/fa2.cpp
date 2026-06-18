@@ -258,8 +258,17 @@ AICORE inline void compute_qk(QKPipe &qkPipe, int tile_id, int sub_tile_id, __gm
         if (sub_tile_id == 0) {
             TALLOC<QKPipe, QKSlotGlobal, TileSplitAxis::TILE_UP_DOWN>(qkPipe, qkSlotGlobal);
         }
-        // The vector softmax consumes the whole TILE_S1 slab before applying the causal mask.
-        // Fill every active QK subtile so masked columns cannot read stale NaNs from the FIFO.
+        if constexpr (CAUSAL_MASK) {
+            const int block_last_s0 = s0_index + static_cast<int>(Cube_S0) - 1;
+            if (s1_index > block_last_s0) {
+                // This QK subtile is future-masked for every row in the block.
+                // compute_p initializes the vector tile to -inf before loading active subtiles.
+                if (sub_tile_id == static_cast<int>(kTileFactor) - 1) {
+                    TPUSH<QKPipe, QKSlotGlobal, TileSplitAxis::TILE_UP_DOWN>(qkPipe, qkSlotGlobal);
+                }
+                return;
+            }
+        }
         using GlobalDataQ =
             GlobalTensor<half, pto::Shape<1, 1, 1, Cube_S0, HEAD_SIZE>, pto::Stride<1, 1, 1, HEAD_SIZE, 1>>;
         using GlobalDataK = GlobalTensor<half, pto::Shape<1, 1, 1, HEAD_SIZE, Cube_S1>,
@@ -417,12 +426,32 @@ AICORE inline void compute_p(QKPipe &qkPipe, PPipe &pPipe, int tile_id, int row_
         using QKLoadGlobal =
             GlobalTensor<float, pto::Shape<1, 1, 1, Vec_S0, Cube_S1>, pto::Stride<1, 1, 1, Cube_S1, 1>>;
         using TileDataFSub = Tile<TileType::Vec, float, Vec_S0, Tile_S1, BLayout::RowMajor, Vec_S0, Cube_S1>;
+        const int max_s0_index = s0_index + static_cast<int>(Vec_S0) - 1;
+        if constexpr (CAUSAL_MASK) {
+            constexpr float negInf = -3.40282e+38;
+            const int last_sub_s1_index = s1_index + (static_cast<int>(kTileFactor) - 1) * static_cast<int>(Cube_S1);
+            if (last_sub_s1_index > max_s0_index) {
+                // Future subtiles skipped by compute_qk must be finite before softmax masking.
+                TEXPANDS(qkVecTile, negInf);
+#if defined(__DAV_C220_VEC__)
+                pipe_barrier(PIPE_V);
+#endif
+                set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+                wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+            }
+        }
         for (int sub_col = 0; sub_col < static_cast<int>(kTileFactor); ++sub_col) {
-            QKLoadGlobal qkLoadGlobal(qk_ptr + static_cast<size_t>(sub_col) * static_cast<size_t>(Cube_S0) *
-                                                   static_cast<size_t>(Cube_S1));
             TileDataFSub qkVecSub;
             TASSIGN(qkVecSub, (uint64_t)qkVecTile.data() +
                                   static_cast<uint64_t>(sub_col) * static_cast<uint64_t>(Cube_S1) * sizeof(float));
+            if constexpr (CAUSAL_MASK) {
+                const int sub_s1_index = s1_index + sub_col * static_cast<int>(Cube_S1);
+                if (sub_s1_index > max_s0_index) {
+                    continue;
+                }
+            }
+            QKLoadGlobal qkLoadGlobal(qk_ptr + static_cast<size_t>(sub_col) * static_cast<size_t>(Cube_S0) *
+                                                   static_cast<size_t>(Cube_S1));
             TLOAD(qkVecSub, qkLoadGlobal);
         }
         if (row_slice == static_cast<int>(kTileFactor) - 1) {

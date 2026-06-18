@@ -200,12 +200,8 @@ AICORE inline void pto_macro_fa_softmax(TileDataD2 __out__ x_exp, TileDataS1 __i
                 p_tile_fp32, triu, s0_index, s1_index);
         }
     } else if constexpr (CAUSAL_MASK) {
-        TMULS(x_exp, x_exp, 0.0);
-        TMULS(exp_max, exp_max, 0.0);
-#if defined(__DAV_C220_VEC__)
-        pipe_barrier(PIPE_V);
-#endif
-        TADDS(exp_max, exp_max, 1.0);
+        TEXPANDS(x_exp, static_cast<typename TileDataD2::DType>(0));
+        TEXPANDS(exp_max, 1.0f);
 #if defined(__DAV_C220_VEC__)
         pipe_barrier(PIPE_V);
 #endif
