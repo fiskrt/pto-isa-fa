@@ -1,6 +1,9 @@
 import argparse
 import os
 from dataclasses import dataclass
+import warnings
+
+warnings.filterwarnings("ignore")
 
 import torch
 import torch_npu
