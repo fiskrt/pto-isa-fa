@@ -258,14 +258,8 @@ AICORE inline void compute_qk(QKPipe &qkPipe, int tile_id, int sub_tile_id, __gm
         if (sub_tile_id == 0) {
             TALLOC<QKPipe, QKSlotGlobal, TileSplitAxis::TILE_UP_DOWN>(qkPipe, qkSlotGlobal);
         }
-        if constexpr (CAUSAL_MASK) {
-            if (s1_index > s0_index) {
-                if (sub_tile_id == static_cast<int>(kTileFactor) - 1) {
-                    TPUSH<QKPipe, QKSlotGlobal, TileSplitAxis::TILE_UP_DOWN>(qkPipe, qkSlotGlobal);
-                }
-                return;
-            }
-        }
+        // The vector softmax consumes the whole TILE_S1 slab before applying the causal mask.
+        // Fill every active QK subtile so masked columns cannot read stale NaNs from the FIFO.
         using GlobalDataQ =
             GlobalTensor<half, pto::Shape<1, 1, 1, Cube_S0, HEAD_SIZE>, pto::Stride<1, 1, 1, HEAD_SIZE, 1>>;
         using GlobalDataK = GlobalTensor<half, pto::Shape<1, 1, 1, HEAD_SIZE, Cube_S1>,
