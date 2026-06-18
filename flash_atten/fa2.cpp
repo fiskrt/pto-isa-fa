@@ -85,6 +85,7 @@ constexpr bool DAV_VEC = false;
 
 constexpr std::size_t MAX_TILE_L1_BYTES = 512U * 1024U;
 constexpr std::size_t MAX_VEC_UB_BYTES = 192U * 1024U;
+constexpr int kFaLaunchCores = 24;
 
 template <typename TileType>
 constexpr AICORE std::size_t tile_storage_bytes()
@@ -602,10 +603,6 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, __gm__ uint64_t *ffts_addr,
     uint64_t tStart = get_sys_cnt();
 
     set_ffts_base_addr((uint64_t)ffts_addr);
-    if constexpr (DAV_CUBE) {
-        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
-        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
-    }
 
     // Rename dimensions for clarity: s0 (rows total), Cube_S0 (per-block rows), s1 (cols), HEAD_SIZE (inner)
     constexpr uint32_t Cube_S0 = CUBE_S0;
@@ -670,10 +667,6 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, __gm__ uint64_t *ffts_addr,
 
     allocate_cube_tile_buffers(qMatTile, kMatTile, pMatTile, vMatTile);
 
-    // Assign accumulator tiles using ping-pong helper. qk starts at 0, pv starts at 1.
-    assign_running_acc_tile(qkAccTile, 0);
-    assign_running_acc_tile(pvAccTile, 1);
-
     // Define tile types for FA softmax P computation
     // UB offsets for softmax tiles
     // Define per-tile vector tiles sized to Cube_S1
@@ -703,18 +696,36 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, __gm__ uint64_t *ffts_addr,
         qkVecTile, m1_local_max, input_reduce_tmp, l1_local_sum, m2_global_max, l2_global_sum, l1_exp_max_ififo, x_expT,
         pvVecTile, runningOTile, guScratch, triu);
 
+    const int physical_block_idx = get_block_idx();
+    // Perfect causal balance for full-sequence cases where s0 has 2 * 24 * n row tiles:
+    // core c owns top pair indices [c*n, (c+1)*n) and their mirrored bottom rows.
+    const bool use_balanced_pairs =
+        CAUSAL_MASK && (static_cast<int>(block_rows) % (2 * kFaLaunchCores) == 0);
+    const int pairs_per_core =
+        use_balanced_pairs ? static_cast<int>(block_rows) / (2 * kFaLaunchCores) : 0;
+    const int scheduled_items =
+        use_balanced_pairs ? pairs_per_core : static_cast<int>(block_rows);
+    const int blocks_per_scheduled_item = use_balanced_pairs ? 2 : 1;
+
+    for (int scheduled_idx = use_balanced_pairs ? 0 : physical_block_idx; scheduled_idx < scheduled_items;
+         scheduled_idx += use_balanced_pairs ? 1 : kFaLaunchCores) {
+    const int top_block_idx =
+        use_balanced_pairs ? physical_block_idx * pairs_per_core + scheduled_idx : scheduled_idx;
+    for (int scheduled_side = 0; scheduled_side < blocks_per_scheduled_item; ++scheduled_side) {
+    const int block_idx =
+        use_balanced_pairs && scheduled_side == 1 ? static_cast<int>(block_rows) - 1 - top_block_idx : top_block_idx;
+    tStart = get_sys_cnt();
+    assign_running_acc_tile(qkAccTile, 0);
+    assign_running_acc_tile(pvAccTile, 1);
+    if constexpr (DAV_CUBE) {
+        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+    }
+
     // block offset for logical S0
-#if defined(__DAV_C220_CUBE__) || defined(__DAV_C220_VEC__) // A5 defined macro, don't need to reassign
-    const int block_idx = get_block_idx();
-#endif
     const int block_offset_rows = block_idx * static_cast<int>(Cube_S0);
 
-    const bool use_cv_comm = (!INTERMEDIATE_CHECK) && (block_rows >= static_cast<uint32_t>(pto::kCvMaxCores));
-    int comm_slot = block_idx;
-
-    if (use_cv_comm) {
-        comm_slot = pto::TSYNC_CVID(block_idx, cv_comm_buf);
-    }
+    const int comm_slot = physical_block_idx;
     __gm__ uint64_t *profile_entry = nullptr;
     if (profile_buf != nullptr) {
         std::size_t profile_block_base = static_cast<std::size_t>(block_idx) * kFaProfileBytesPerBlock;
@@ -913,6 +924,8 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, __gm__ uint64_t *ffts_addr,
     if (profile_entry != nullptr) {
         profile_entry[1] = tEnd;
     }
+    }
+    }
 }
 
 // Empty kernel to warm up cores
@@ -948,11 +961,9 @@ void LaunchTFA(int s0, int s1, uint16_t *ffts, aclFloat16 *q, aclFloat16 *k, acl
     assert(s0 % CUBE_S0 == 0);
     assert(s1 % CUBE_S1 == 0);
     assert(s1 % TILE_S1 == 0);
-    const uint32_t block_rows = static_cast<uint32_t>(s0 / CUBE_S0);
 
-#if defined(__DAV_C220_CUBE__) || defined(__DAV_C220_VEC__)
-    warmup_kernel<<<24, nullptr, stream>>>();
 
+    // questionable if this is helpful
     const uint64_t q_tensor_bytes =
         static_cast<uint64_t>(s0) * static_cast<uint64_t>(HEAD_SIZE) * sizeof(half);
     const uint64_t kv_tensor_bytes =
@@ -960,10 +971,9 @@ void LaunchTFA(int s0, int s1, uint16_t *ffts, aclFloat16 *q, aclFloat16 *k, acl
     PTO_PREFETCH((__gm__ void *)q, q_tensor_bytes, stream);
     PTO_PREFETCH((__gm__ void *)k, kv_tensor_bytes, stream);
     PTO_PREFETCH((__gm__ void *)v, kv_tensor_bytes, stream);
-#endif
 
     runTFATemplate<HEAD_SIZE, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, CV_FIFO_SIZE, INTERMEDIATE_CHECK, CAUSAL_MASK,
-                   CV_FIFO_CONS_SYNC_PERIOD><<<block_rows, nullptr, stream>>>(
+                   CV_FIFO_CONS_SYNC_PERIOD><<<kFaLaunchCores, nullptr, stream>>>(
         s0, s1, (__gm__ uint64_t *)ffts, (half *)q, (half *)k, (half *)v, (half *)p_tile_fifo, exp_max_ififo,
         global_sum_out, exp_max_out, o_out, o_parts_out, qk_tile_fifo, pv_tile_fifo, cv_comm_buf, profile_data);
 }
