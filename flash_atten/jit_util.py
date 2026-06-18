@@ -10,7 +10,7 @@ import torch
 
 
 THIS_DIR = Path(__file__).resolve().parent
-DEFAULT_KERNEL_CPP = THIS_DIR / "fa_performance_kernel.cpp"
+DEFAULT_KERNEL_CPP = THIS_DIR / "fa2.cpp"
 DEFAULT_BUILD_ROOT = THIS_DIR / ".jit"
 
 CV_FIFO_SIZE = 8
@@ -154,7 +154,7 @@ def _render_wrapper(case: TfaCase) -> str:
     )
     return f"""#include <cstdint>
 
-#include "fa_performance_kernel.h"
+#include "fa2.h"
 
 #include "runtime/rt.h"
 
@@ -283,7 +283,7 @@ def compile_flash(
     timeout: int = 300,
 ) -> tuple[Path, TfaCase]:
     """
-    Build fa_performance_kernel.cpp for one concrete TFA tile configuration.
+    Build fa2.cpp for one concrete TFA tile configuration.
 
     The generated shared object exports:
         int call_kernel(void *stream, void *q, void *k, void *v, ...workspace..., int s0, int s1)
@@ -371,7 +371,7 @@ class FlashTfa:
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        stream_ptr: ctypes.c_void_p | int | None = None,
+        stream_ptr: ctypes.c_void_p | int | None = None, # todo: remove, always just get stream before call
     ) -> torch.Tensor:
         case = self.case
         if q.ndim != 2 or k.ndim != 2 or v.ndim != 2:

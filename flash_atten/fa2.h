@@ -8,8 +8,8 @@ INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A
 See LICENSE in the root of the software repository for the full text of the License.
 */
 
-#ifndef FA_PERFORMANCE_KERNEL_H
-#define FA_PERFORMANCE_KERNEL_H
+#ifndef fa2_H
+#define fa2_H
 
 #include <acl/acl.h>
 #include <cstddef>
@@ -34,4 +34,4 @@ void LaunchTFA(int s0, int s1, uint16_t *ffts, aclFloat16 *q, aclFloat16 *k, acl
                float *qk_tile_fifo, float *pv_tile_fifo, uint8_t *profile_data, aclrtStream stream,
                uint8_t *cv_comm_buf = nullptr);
 
-#endif // FA_PERFORMANCE_KERNEL_H
+#endif // fa2_H
