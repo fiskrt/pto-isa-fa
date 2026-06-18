@@ -134,6 +134,25 @@ def title_args(args):
     return f"B={args.B}, Q={args.Q or 'S'}, H={args.H}, QH={q_heads}, KVH={kv_heads}, D={args.D}, causal={args.causal}"
 
 
+def annotate_ratio(ax, ptoisa_by_s, ascendc_by_s, value_fn):
+    for s_len in sorted(ptoisa_by_s.keys() & ascendc_by_s.keys()):
+        ptoisa_value = value_fn(ptoisa_by_s[s_len])
+        ascendc_value = value_fn(ascendc_by_s[s_len])
+        if ascendc_value == 0:
+            continue
+        ratio = ptoisa_value / ascendc_value
+        ax.annotate(
+            f"{ratio:.2f}x",
+            xy=(s_len, max(ptoisa_value, ascendc_value)),
+            xytext=(0, 8),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color="#2F2F2F",
+        )
+
+
 def plot_results(results, path, args):
     import matplotlib
 
@@ -150,10 +169,11 @@ def plot_results(results, path, args):
     }
     names = ["PTOISA", "AscendC npu_fusion_attention"]
     xs = sorted({row.s for row in results})
+    series_by_name = {name: sorted((row for row in results if row.name == name), key=lambda row: row.s) for name in names}
 
     fig, (ax_tflops, ax_ms) = plt.subplots(2, 1, figsize=(7.5, 7), sharex=True)
     for name in names:
-        series = sorted((row for row in results if row.name == name), key=lambda row: row.s)
+        series = series_by_name[name]
         if not series:
             continue
         ax_tflops.plot(
@@ -173,16 +193,23 @@ def plot_results(results, path, args):
             label=name,
         )
 
+    ptoisa_by_s = {row.s: row for row in series_by_name["PTOISA"]}
+    ascendc_by_s = {row.s: row for row in series_by_name["AscendC npu_fusion_attention"]}
+    annotate_ratio(ax_tflops, ptoisa_by_s, ascendc_by_s, lambda row: row.tflops)
+    annotate_ratio(ax_ms, ptoisa_by_s, ascendc_by_s, lambda row: row.ms)
+
     for ax in (ax_tflops, ax_ms):
         ax.set_xscale("log", base=2)
+        ax.margins(y=0.18)
         ax.grid(True, which="both", linestyle=":", linewidth=0.8, alpha=0.75)
         ax.legend(frameon=False)
 
     ax_tflops.set_ylabel("TFLOPS")
+    ax_ms.set_yscale("log")
     ax_ms.set_ylabel("Time (ms)")
     ax_ms.set_xlabel("Sequence length S")
     ax_ms.set_xticks(xs)
-    ax_ms.set_xticklabels([f"{s // 1024}k" for s in xs])
+    ax_ms.set_xticklabels([f"{s // 1024}k" for s in xs], rotation=60, ha="right")
     fig.suptitle(title_args(args))
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     plot_dir = os.path.dirname(path)
@@ -222,6 +249,7 @@ def main():
         p.error("--q-heads must be divisible by --kv-heads")
 
     S_values = [2**n for n in range(10, 17)]
+    S_values.extend([48*128*n for n in range(1, 9)])
     if args.S:
         S_values = [args.S]
     flash = jit_compile_flash(
