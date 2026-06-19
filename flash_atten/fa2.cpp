@@ -14,11 +14,7 @@ See LICENSE in the root of the software repository for the full text of the Lice
 
 #include "fa2.h"
 #include <pto/npu/kernels/Pto_prefetch.hpp>
-#if defined(__DAV_C220_CUBE__) || defined(__DAV_C220_VEC__)
 #include <pto/npu/a2a3/custom/TSyncCVID.hpp>
-#elif defined(__DAV_C310_CUBE__) || defined(__DAV_C310_VEC__)
-#include <pto/npu/a5/custom/TSyncCVID.hpp>
-#endif
 #include "pto_macro_matmul.hpp"
 #include "pto_macro_fa_softmax.hpp"
 #include "pto_macro_fa_gu.hpp"
@@ -781,15 +777,9 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, __gm__ uint64_t *ffts_addr,
 
     // FIFO definitions
     constexpr uint8_t FiFoDepth = CV_FIFO_SIZE;
-#if defined(__DAV_C220_CUBE__) || defined(__DAV_C220_VEC__)
     constexpr uint8_t QK_PIPE_DIR = Direction::DIR_C2V;
     constexpr uint8_t P_PIPE_DIR = Direction::DIR_V2C;
     constexpr uint8_t PV_PIPE_DIR = Direction::DIR_C2V;
-#elif defined(__DAV_C310_CUBE__) || defined(__DAV_C310_VEC__)
-    constexpr uint8_t QK_PIPE_DIR = Direction::DIR_C2V_GM;
-    constexpr uint8_t P_PIPE_DIR = Direction::DIR_V2C_GM;
-    constexpr uint8_t PV_PIPE_DIR = Direction::DIR_C2V_GM;
-#endif
 
     using QKPipe = TPipe<BUF0_QK_READY, QK_PIPE_DIR, Cube_S0 * Tile_S1 * sizeof(float), FiFoDepth, 2, false, true>;
     QKPipe qkPipe(qk_tile_fifo_block, (uint32_t)(uint64_t)qkVecTile[0].data(), 0x0);
