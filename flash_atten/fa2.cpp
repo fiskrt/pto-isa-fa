@@ -475,9 +475,7 @@ AICORE inline void compute_p(int tile_id, int row_slice, __gm__ float *exp_max_i
             if (last_sub_s1_index > max_s0_index) {
                 // Future subtiles skipped by compute_qk must be finite before softmax masking.
                 TEXPANDS(qkVecTile, negInf);
-#if defined(__DAV_C220_VEC__)
                 pipe_barrier(PIPE_V);
-#endif
                 set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
                 wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
             }
