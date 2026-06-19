@@ -101,34 +101,33 @@ def bench_ptoisa(flash, q, k, v, args, q_len, s_len, q_heads, kv_heads):
     return BenchResult("PTOISA", args.B, q_len, s_len, us, flops)
 
 
-def make_ascendc_runner(q, k, v, q_heads, head_size, causal):
+def make_ascendc_runner(q, k, v, q_heads, kv_heads, head_size, causal):
     sm_scale = (1.0 / head_size) ** 0.5
     atten_mask = torch.triu(torch.ones(2048, 2048, dtype=torch.bool), diagonal=1) if causal else None
 
     def run_once():
-        return torch_npu.npu_fusion_attention(
+        return torch_npu.npu_fused_infer_attention_score(
             q,
             k,
             v,
-            q_heads,
-            padding_mask=None,
             atten_mask=atten_mask,
+            num_heads=q_heads,
             scale=sm_scale,
-            keep_prob=1.0,
             input_layout="BNSD",
-            pre_tockens=65535,
-            next_tockens=65535,
+            num_key_value_heads=kv_heads,
+            pre_tokens=65535,
+            next_tokens=65535,
             sparse_mode=3 if causal else 0,
         )[0]
 
     return run_once
 
 
-def bench_ascendc(q, k, v, args, q_len, s_len, q_heads):
-    run_once = make_ascendc_runner(q, k, v, q_heads, args.D, args.causal)
+def bench_ascendc(q, k, v, args, q_len, s_len, q_heads, kv_heads):
+    run_once = make_ascendc_runner(q, k, v, q_heads, kv_heads, args.D, args.causal)
     us = bench_callable(run_once, args)
     flops = attn_flops(args.B, q_len, s_len, q_heads, args.D, args.causal)
-    return BenchResult("AscendC npu_fusion_attention", args.B, q_len, s_len, us, flops)
+    return BenchResult("AscendC npu_fused_infer_attention_score", args.B, q_len, s_len, us, flops)
 
 
 def title_args(args):
@@ -164,13 +163,13 @@ def plot_results(results, path, args):
 
     colors = {
         "PTOISA": "#0072B2",
-        "AscendC npu_fusion_attention": "#D55E00",
+        "AscendC npu_fused_infer_attention_score": "#D55E00",
     }
     markers = {
         "PTOISA": "o",
-        "AscendC npu_fusion_attention": "s",
+        "AscendC npu_fused_infer_attention_score": "s",
     }
-    names = ["PTOISA", "AscendC npu_fusion_attention"]
+    names = ["PTOISA", "AscendC npu_fused_infer_attention_score"]
     xs = sorted({row.s for row in results})
     series_by_name = {name: sorted((row for row in results if row.name == name), key=lambda row: row.s) for name in names}
 
@@ -197,7 +196,7 @@ def plot_results(results, path, args):
         )
 
     ptoisa_by_s = {row.s: row for row in series_by_name["PTOISA"]}
-    ascendc_by_s = {row.s: row for row in series_by_name["AscendC npu_fusion_attention"]}
+    ascendc_by_s = {row.s: row for row in series_by_name["AscendC npu_fused_infer_attention_score"]}
     annotate_ratio(ax_tflops, ptoisa_by_s, ascendc_by_s, lambda row: row.tflops)
     annotate_ratio(ax_ms, ptoisa_by_s, ascendc_by_s, lambda row: row.ms)
 
@@ -272,18 +271,18 @@ def main():
         v = torch.randn(b, kv_heads, s_len, d, dtype=torch.float16)
 
         ptoisa_result = bench_ptoisa(flash, q, k, v, args, q_len, s_len, q_heads, kv_heads)
-        ascendc_result = bench_ascendc(q, k, v, args, q_len, s_len, q_heads)
+        ascendc_result = bench_ascendc(q, k, v, args, q_len, s_len, q_heads, kv_heads)
         results.extend([ptoisa_result, ascendc_result])
 
         for result in (ptoisa_result, ascendc_result):
             print(
-                f"{result.name:<28} B={result.b:<3} Q={result.q:<6} S={result.s:<6} "
+                f"{result.name:<45} B={result.b:<3} Q={result.q:<6} S={result.s:<6} "
                 f"{result.ms:.3f} ms  {result.tflops:.2f} TFLOPS"
             )
 
     if args.plot:
         plot_results(results, args.plot, args)
-        print(f"Saved plot: {args.plot}")
+        #print(f"Saved plot: {args.plot}")
 
 
 if __name__ == "__main__":
