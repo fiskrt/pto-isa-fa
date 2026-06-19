@@ -39,7 +39,16 @@ def attn_flops(b, q, s, h, d, causal):
     return 4 * b * h * pairs * d
 
 
-def ref_flash_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool) -> torch.Tensor:
+def make_attention_keep_mask(q_len: int, kv_len: int, causal: bool, device: torch.device) -> torch.Tensor:
+    if not causal:
+        return torch.ones((q_len, kv_len), dtype=torch.bool, device=device)
+
+    q_pos = torch.arange(q_len, device=device)[:, None]
+    kv_pos = torch.arange(kv_len, device=device)[None, :]
+    return kv_pos <= q_pos + (kv_len - q_len)
+
+
+def ref_native_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool) -> torch.Tensor:
     if k.shape[1] != q.shape[1]:
         n_rep = q.shape[1] // k.shape[1]
         k = k.repeat_interleave(n_rep, dim=1)
@@ -53,6 +62,18 @@ def ref_flash_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bo
         dropout_p=0.0,
         is_causal=causal,
     )
+
+    # this will OOM since its naive
+    # q_float = q.float()
+    # k_float = k.float()
+    # v_float = v.float()
+    # scale = (1.0 / q.shape[-1]) ** 0.5
+    # scores = torch.matmul(q_float, k_float.transpose(-2, -1)) * scale
+    # keep_mask = make_attention_keep_mask(q.shape[-2], k.shape[-2], causal, q.device)
+    # keep_mask = keep_mask[None, None, :, :]
+    # scores = scores.masked_fill(~keep_mask, torch.finfo(scores.dtype).min)
+    # probs = torch.softmax(scores, dim=-1).masked_fill(~keep_mask, 0.0)
+    # return torch.matmul(probs, v_float)
 
 
 def bench_callable(fn, args):
@@ -91,7 +112,7 @@ def bench_ptoisa(flash, q, k, v, args, q_len, s_len, q_heads, kv_heads):
     if args.check:
         run_once()
         torch.npu.synchronize()
-        ref_output = ref_flash_attn(q, k, v, args.causal)
+        ref_output = ref_native_attention(q, k, v, args.causal)
         torch.npu.synchronize()
         torch.testing.assert_close(ref_output, output, rtol=1e-3, atol=1e-3)
         print(f"PTOISA Check Passed! B={args.B} Q={q_len} S={s_len}")

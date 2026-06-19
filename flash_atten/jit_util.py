@@ -202,6 +202,7 @@ def _kernel_compile_command(kernel_cpp: Path, kernel_lib_path: Path, build_dir: 
     flags = [
         "-fPIC",
         "-shared",
+        #"-g",
         "-D_FORTIFY_SOURCE=2",
         "-O2",
         "-std=c++17",
@@ -223,6 +224,7 @@ def _wrapper_compile_command(wrapper_cpp: Path, kernel_lib_path: Path, lib_path:
     flags = [
         "-fPIC",
         "-shared",
+       # "-g",
         "-D_FORTIFY_SOURCE=2",
         "-O2",
         "-std=c++17",
