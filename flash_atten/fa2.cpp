@@ -735,23 +735,18 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, __gm__ uint64_t *ffts_addr,
         pvVecTile, runningOTile, guScratch, triu);
 
     const int physical_block_idx = get_block_idx();
-    // Perfect causal balance for full-sequence cases where s0 has 2 * 24 * n row tiles:
-    // core c owns top pair indices [c*n, (c+1)*n) and their mirrored bottom rows.
-    const bool use_balanced_pairs =
-        CAUSAL_MASK && (static_cast<int>(block_rows) % (2 * kFaLaunchCores) == 0);
-    const int pairs_per_core =
-        use_balanced_pairs ? static_cast<int>(block_rows) / (2 * kFaLaunchCores) : 0;
-    const int scheduled_items =
-        use_balanced_pairs ? pairs_per_core : static_cast<int>(block_rows);
-    const int blocks_per_scheduled_item = use_balanced_pairs ? 2 : 1;
-
-    for (int scheduled_idx = use_balanced_pairs ? 0 : physical_block_idx; scheduled_idx < scheduled_items;
-         scheduled_idx += use_balanced_pairs ? 1 : kFaLaunchCores) {
-    const int top_block_idx =
-        use_balanced_pairs ? physical_block_idx * pairs_per_core + scheduled_idx : scheduled_idx;
-    for (int scheduled_side = 0; scheduled_side < blocks_per_scheduled_item; ++scheduled_side) {
-    const int block_idx =
-        use_balanced_pairs && scheduled_side == 1 ? static_cast<int>(block_rows) - 1 - top_block_idx : top_block_idx;
+    // Assign descending S0 blocks in alternating directions across the cores. Two complete waves pair
+    // expensive bottom blocks with cheap top blocks exactly; a partial wave is folded back onto the
+    // least-loaded end of the preceding wave. This gives one schedule for causal and dense attention,
+    // including block counts that are not multiples of 2 * kFaLaunchCores.
+    for (int schedule_wave = 0;; ++schedule_wave) {
+    const int position_in_wave = ((schedule_wave & 1) == 0) ?
+                                     physical_block_idx :
+                                     (kFaLaunchCores - 1 - physical_block_idx);
+    const int descending_rank = schedule_wave * kFaLaunchCores + position_in_wave;
+    if (descending_rank >= static_cast<int>(block_rows))
+        break;
+    const int block_idx = static_cast<int>(block_rows) - 1 - descending_rank;
     tStart = get_sys_cnt();
     assign_running_acc_tile(qkAccTile, 0);
     assign_running_acc_tile(pvAccTile, 1);
@@ -935,7 +930,6 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, __gm__ uint64_t *ffts_addr,
     uint64_t tEnd = get_sys_cnt();
     if (profile_entry != nullptr) {
         profile_entry[1] = tEnd;
-    }
     }
     }
 }
