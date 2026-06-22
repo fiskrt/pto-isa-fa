@@ -661,11 +661,8 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, __gm__ uint64_t *ffts_addr,
     // --------------------------
     // Tuning knobs (pipeline)
     //
-    // qkPreloadNum controls how many (QK -> P) tiles we warm up before entering the steady-state loop.
-    // - Larger preload improves overlap (Cube/VEC concurrency) for long S1.
-    // - Larger preload increases FIFO footprint (qkGlobalTensorNBuffers / pvGlobalTensorNBuffers /
-    // guGlobalTensorNBuffers).
-    constexpr uint32_t qkPreloadNum = QK_PRELOAD;
+    // QK_PRELOAD remains a template argument for host/JIT compatibility, but the scheduler uses a fixed
+    // one-tile lookahead instead of building a multi-tile backlog before starting PV.
 
     // Buffer counts for optional double-buffering (default 1)
     // - srcVecTNBuffers/xexpVecTNBuffers: Vec ping-pong for QK load and x_exp output
@@ -680,9 +677,8 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, __gm__ uint64_t *ffts_addr,
     constexpr uint32_t vMatTNBuffers = 2;
     constexpr uint32_t qkp_tile_fifo_size = CV_FIFO_SIZE;
     constexpr uint32_t pv_tile_fifo_size = CV_FIFO_SIZE;
-    static_assert(qkPreloadNum >= 1, "qkPreloadNum must be >= 1");
+    static_assert(CV_FIFO_SIZE >= 2, "CV FIFO must hold the current and next QK tiles");
     static_assert(CV_FIFO_CONS_SYNC_PERIOD >= 1, "CV_FIFO_CONS_SYNC_PERIOD must be >= 1");
-    static_assert((qkPreloadNum > 1) || (kTileFactor == 1), "qkPreloadNum must be > 1 unless kTileFactor == 1");
 
     // Define tile types for first QK matmul
     using TileMatQData =
@@ -821,87 +817,91 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, __gm__ uint64_t *ffts_addr,
     int k_src_pingpong_id = 0;    // separate ping-pong for K tiles
     int pv_src_pingpong_id = 0;   // separate ping-pong for P V tiles
 
-    // QK and P pre-computation (tile_id based)
-    for (int preload_tile = 0; preload_tile < static_cast<int>(qkPreloadNum) && preload_tile < num_tiles_s1;
-         ++preload_tile) {
-        if constexpr (DAV_CUBE) {
-            for (int sub_tile = 0; sub_tile < static_cast<int>(kTileFactor); ++sub_tile) {
-                assign_running_acc_tile(qkAccTile);
-                compute_qk<HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, qkp_tile_fifo_size, CV_FIFO_CONS_SYNC_PERIOD,
-                           INTERMEDIATE_CHECK, CAUSAL_MASK>(
-                    preload_tile, sub_tile, q_block, k, qk_tile_fifo_block, qMatTile[0],
-                    kMatTile[k_src_pingpong_id % kMatTNBuffers], qkAccTile,
-                    k_src_pingpong_id % kMatTNBuffers, block_idx);
-                k_src_pingpong_id++;
-            }
-        }
-        if constexpr (DAV_VEC) {
-            for (int row_slice = 0; row_slice < static_cast<int>(kTileFactor); ++row_slice) {
-                // Init only on the very first S1 tile; row_slice partitions rows within that tile
-                compute_p<HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, qkp_tile_fifo_size, CV_FIFO_CONS_SYNC_PERIOD,
-                          INTERMEDIATE_CHECK, CAUSAL_MASK>(
-                    preload_tile, row_slice, exp_max_ififo_block, qk_tile_fifo_block, p_tile_fifo_block,
-                    global_sum_block, exp_max_block, qkVecTile[p_gu_src_pingpong_id % srcVecTNBuffers],
-                    x_expT[p_gu_src_pingpong_id % xexpVecTNBuffers], input_reduce_tmp, m1_local_max, l1_local_sum,
-                    m2_global_max, l2_global_sum, l1_exp_max_ififo[preload_tile % qkp_tile_fifo_size], triu,
-                    p_gu_src_pingpong_id % xexpVecTNBuffers, block_idx);
-                p_gu_src_pingpong_id++;
-            }
+    // Seed QK(0). Vec enters the main loop immediately and computes P(0) while Cube advances to QK(1).
+    if constexpr (DAV_CUBE) {
+        for (int sub_tile = 0; sub_tile < static_cast<int>(kTileFactor); ++sub_tile) {
+            assign_running_acc_tile(qkAccTile);
+            compute_qk<HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, qkp_tile_fifo_size, CV_FIFO_CONS_SYNC_PERIOD,
+                       INTERMEDIATE_CHECK, CAUSAL_MASK>(
+                0, sub_tile, q_block, k, qk_tile_fifo_block, qMatTile[0],
+                kMatTile[k_src_pingpong_id % kMatTNBuffers], qkAccTile,
+                k_src_pingpong_id % kMatTNBuffers, block_idx);
+            k_src_pingpong_id++;
         }
     }
 
-    for (int tile_id = 0; tile_id < num_tiles_s1; ++tile_id) {
-        int next_qk_tile = (tile_id + static_cast<int>(qkPreloadNum) >= num_tiles_s1) ?
-                               -1 :
-                               (tile_id + static_cast<int>(qkPreloadNum));
+    // Alternate the two engines after the seed:
+    //   QK(1) || P(0), PV(0) || P(1), QK(2) || GU(0), PV(1) || P(2), ...
+    const int pipeline_phases = 2 * num_tiles_s1 + 1;
+    for (int phase = 0; phase < pipeline_phases; ++phase) {
+        int qk_tile = -1;
+        int p_tile = -1;
+        int pv_tile = -1;
+        int gu_tile = -1;
 
-        if (next_qk_tile != -1)
-            assign_running_acc_tile(qkAccTile);
-        assign_running_acc_tile(pvAccTile);
+        if (phase == 0) {
+            qk_tile = 1;
+            p_tile = 0;
+        } else if ((phase & 1) != 0) {
+            pv_tile = (phase - 1) / 2;
+            p_tile = (phase + 1) / 2;
+        } else {
+            qk_tile = phase / 2 + 1;
+            gu_tile = phase / 2 - 1;
+        }
 
-        for (int sub_tile = 0; sub_tile < static_cast<int>(kTileFactor); ++sub_tile) {
-            if constexpr (DAV_CUBE) {
-                if (next_qk_tile != -1) {
+        if constexpr (DAV_CUBE) {
+            if (qk_tile >= 0 && qk_tile < num_tiles_s1) {
+                for (int sub_tile = 0; sub_tile < static_cast<int>(kTileFactor); ++sub_tile) {
+                    assign_running_acc_tile(qkAccTile);
                     compute_qk<HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, qkp_tile_fifo_size, CV_FIFO_CONS_SYNC_PERIOD,
                                INTERMEDIATE_CHECK, CAUSAL_MASK>(
-                        next_qk_tile, sub_tile, q_block, k, qk_tile_fifo_block, qMatTile[0],
+                        qk_tile, sub_tile, q_block, k, qk_tile_fifo_block, qMatTile[0],
                         kMatTile[k_src_pingpong_id % kMatTNBuffers], qkAccTile,
                         k_src_pingpong_id % kMatTNBuffers, block_idx);
                     k_src_pingpong_id++;
                 }
             }
+        }
 
-            if constexpr (DAV_VEC) {
-                if (next_qk_tile != -1) {
+        if constexpr (DAV_VEC) {
+            if (p_tile >= 0 && p_tile < num_tiles_s1) {
+                for (int row_slice = 0; row_slice < static_cast<int>(kTileFactor); ++row_slice) {
                     compute_p<HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, qkp_tile_fifo_size, CV_FIFO_CONS_SYNC_PERIOD,
                               INTERMEDIATE_CHECK, CAUSAL_MASK>(
-                        next_qk_tile, sub_tile, exp_max_ififo_block, qk_tile_fifo_block, p_tile_fifo_block,
-                        global_sum_block, exp_max_block,
-                        qkVecTile[p_gu_src_pingpong_id % srcVecTNBuffers],
+                        p_tile, row_slice, exp_max_ififo_block, qk_tile_fifo_block, p_tile_fifo_block,
+                        global_sum_block, exp_max_block, qkVecTile[p_gu_src_pingpong_id % srcVecTNBuffers],
                         x_expT[p_gu_src_pingpong_id % xexpVecTNBuffers], input_reduce_tmp, m1_local_max, l1_local_sum,
-                        m2_global_max, l2_global_sum, l1_exp_max_ififo[next_qk_tile % qkp_tile_fifo_size], triu,
+                        m2_global_max, l2_global_sum, l1_exp_max_ififo[p_tile % qkp_tile_fifo_size], triu,
                         p_gu_src_pingpong_id % xexpVecTNBuffers, block_idx);
                     p_gu_src_pingpong_id++;
                 }
             }
+        }
 
-            if constexpr (DAV_CUBE) {
-                compute_pv<HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, qkp_tile_fifo_size, pv_tile_fifo_size,
-                           CV_FIFO_CONS_SYNC_PERIOD, INTERMEDIATE_CHECK, CAUSAL_MASK>(
-                    tile_id, sub_tile, v, p_tile_fifo_block, pv_tile_fifo_block,
-                    pMatTile[pv_src_pingpong_id % pMatTNBuffers], vMatTile[pv_src_pingpong_id % vMatTNBuffers],
-                    pvAccTile, pv_src_pingpong_id % vMatTNBuffers + PV_EVENT_ID0, block_idx);
-                pv_src_pingpong_id++;
+        if constexpr (DAV_CUBE) {
+            if (pv_tile >= 0 && pv_tile < num_tiles_s1) {
+                assign_running_acc_tile(pvAccTile);
+                for (int sub_tile = 0; sub_tile < static_cast<int>(kTileFactor); ++sub_tile) {
+                    compute_pv<HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, qkp_tile_fifo_size, pv_tile_fifo_size,
+                               CV_FIFO_CONS_SYNC_PERIOD, INTERMEDIATE_CHECK, CAUSAL_MASK>(
+                        pv_tile, sub_tile, v, p_tile_fifo_block, pv_tile_fifo_block,
+                        pMatTile[pv_src_pingpong_id % pMatTNBuffers], vMatTile[pv_src_pingpong_id % vMatTNBuffers],
+                        pvAccTile, pv_src_pingpong_id % vMatTNBuffers + PV_EVENT_ID0, block_idx);
+                    pv_src_pingpong_id++;
+                }
             }
         }
 
         if constexpr (DAV_VEC) {
-            compute_gu<HEAD_SIZE, CUBE_S0, Tile_S1, pv_tile_fifo_size, CV_FIFO_CONS_SYNC_PERIOD,
-                       INTERMEDIATE_CHECK, CAUSAL_MASK>(
-                tile_id, num_tiles_s1, o_out_block, o_parts_block, pv_tile_fifo_block, runningOTile,
-                pvVecTile[p_gu_src_pingpong_id % outOTileNBuffers], l1_exp_max_ififo[tile_id % qkp_tile_fifo_size],
-                l2_global_sum, guScratch, p_gu_src_pingpong_id % outOTileNBuffers);
-            p_gu_src_pingpong_id++;
+            if (gu_tile >= 0 && gu_tile < num_tiles_s1) {
+                compute_gu<HEAD_SIZE, CUBE_S0, Tile_S1, pv_tile_fifo_size, CV_FIFO_CONS_SYNC_PERIOD,
+                           INTERMEDIATE_CHECK, CAUSAL_MASK>(
+                    gu_tile, num_tiles_s1, o_out_block, o_parts_block, pv_tile_fifo_block, runningOTile,
+                    pvVecTile[p_gu_src_pingpong_id % outOTileNBuffers], l1_exp_max_ififo[gu_tile % qkp_tile_fifo_size],
+                    l2_global_sum, guScratch, p_gu_src_pingpong_id % outOTileNBuffers);
+                p_gu_src_pingpong_id++;
+            }
         }
     }
 
