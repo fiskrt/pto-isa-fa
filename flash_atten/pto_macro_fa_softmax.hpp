@@ -44,6 +44,54 @@ constexpr AICORE inline float constexpr_inv_sqrt(float x)
     return 1.0f / constexpr_sqrt(x);
 }
 
+// Apply the causal mask directly to the score tile. Unlike TTRI + TMULS + TADD,
+// this only writes the invalid suffix of each row. Vector addresses remain
+// 256-byte aligned for fp32; a masked first repeat handles an unaligned suffix.
+template <typename TileData>
+AICORE inline void causal_suffix_fill(TileData &dst, int first_invalid_col_row0)
+{
+    using T = typename TileData::DType;
+    static_assert(std::is_same_v<T, float>, "causal_suffix_fill currently supports fp32 scores only");
+    static_assert((TileData::Cols % 64) == 0, "causal_suffix_fill requires a 64-element-aligned row width");
+    static_assert((TileData::RowStride % 64) == 0,
+                  "causal_suffix_fill requires a 256-byte-aligned fp32 row stride");
+
+    constexpr int kElementsPerRepeat = 64;
+    float negInf = -3.40282e+38f;
+    __ubuf__ T *dst_ptr = reinterpret_cast<__ubuf__ T *>(dst.data());
+
+    set_mask_norm();
+    for (int row = 0; row < static_cast<int>(TileData::Rows); ++row) {
+        int first_invalid = first_invalid_col_row0 + row;
+        if (first_invalid < 0) {
+            first_invalid = 0;
+        } else if (first_invalid >= static_cast<int>(TileData::Cols)) {
+            continue;
+        }
+
+        __ubuf__ T *row_ptr = dst_ptr + row * TileData::RowStride;
+        const int first_repeat = first_invalid / kElementsPerRepeat;
+        const int first_lane = first_invalid % kElementsPerRepeat;
+        const int aligned_start = first_repeat * kElementsPerRepeat;
+
+        if (first_lane != 0) {
+            const uint64_t suffix_mask = ~((uint64_t{1} << first_lane) - 1);
+            set_vector_mask(0, suffix_mask);
+            vector_dup(row_ptr + aligned_start, negInf, 1, 1, 1, 8, 0);
+            pipe_barrier(PIPE_V);
+        }
+
+        const int full_start = aligned_start + (first_lane == 0 ? 0 : kElementsPerRepeat);
+        const int full_repeats = (static_cast<int>(TileData::Cols) - full_start) / kElementsPerRepeat;
+        if (full_repeats > 0) {
+            set_vector_mask(-1, -1);
+            vector_dup(row_ptr + full_start, negInf, static_cast<uint8_t>(full_repeats), 1, 1, 8, 0);
+            pipe_barrier(PIPE_V);
+        }
+    }
+    set_vector_mask(-1, -1);
+}
+
 template <int HEAD_SIZE, bool CAUSAL_MASK, typename ReduceTileD1, typename TileDataD2, typename TileDataS1>
 AICORE inline void softmax_opt_fa_init_impl(TileDataD2 __out__ x_exp, TileDataS1 __in__ input_x,
                                             ReduceTileD1 __out__ local_max, ReduceTileD1 __out__ local_sum,
@@ -63,20 +111,9 @@ AICORE inline void softmax_opt_fa_init_impl(TileDataD2 __out__ x_exp, TileDataS1
     Tile1D_fp32 p_tile_f32_1d;
     Tile1D_out x_exp_1d;
     if constexpr (CAUSAL_MASK) {
-        constexpr float negInf = -3.40282e+38;
         const int diagonal = s0_index - s1_index + 1;
-        TTRI<TileDataS1, 1>(triu, diagonal);
-#if defined(__DAV_C220_VEC__)
-        pipe_barrier(PIPE_V);
-#endif
-        TMULS(triu, triu, negInf);
-#if defined(__DAV_C220_VEC__)
-        pipe_barrier(PIPE_V);
-#endif
-        TADD(input_x, input_x, triu);
-#if defined(__DAV_C220_VEC__)
-        pipe_barrier(PIPE_V);
-#endif
+        causal_suffix_fill(input_x, diagonal);
+        (void)triu;
     }
     // FA2.0 init mode
     TROWMAX(new_global_max, input_x, tmp_float);
@@ -121,20 +158,9 @@ AICORE inline void softmax_opt_fa_not_init_impl(TileDataD2 __out__ x_exp, TileDa
     Tile1D_out x_exp_1d;
 
     if constexpr (CAUSAL_MASK) {
-        constexpr float negInf = -3.40282e+38;
         const int diagonal = s0_index - s1_index + 1;
-        TTRI<TileDataS1, 1>(triu, diagonal);
-#if defined(__DAV_C220_VEC__)
-        pipe_barrier(PIPE_V);
-#endif
-        TMULS(triu, triu, negInf);
-#if defined(__DAV_C220_VEC__)
-        pipe_barrier(PIPE_V);
-#endif
-        TADD(input_x, input_x, triu);
-#if defined(__DAV_C220_VEC__)
-        pipe_barrier(PIPE_V);
-#endif
+        causal_suffix_fill(input_x, diagonal);
+        (void)triu;
     }
     // FA2.0 streaming mode (not first tile): update (global_max, global_sum) and rescale old sums.
     TROWMAX(local_max, input_x, tmp_float);
