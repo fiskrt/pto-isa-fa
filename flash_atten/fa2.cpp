@@ -393,11 +393,14 @@ AICORE inline void compute_pv(int tile_id, int sub_tile_id, __gm__ half *v, __gm
         GlobalVT vLoad((__gm__ half *)(v + s1_index * HEAD_SIZE));
         TLOAD(vMatTile, vLoad);
 
-        using PLoadGlobal = GlobalTensor<half, pto::Shape<1, 1, 1, Cube_S0, Cube_S1>, pto::Stride<1, 1, 1, Cube_S1, 1>>;
+        // P is row-major across the full logical S1 tile so each Vec row slice can be emitted with one
+        // large TSTORE. Cube gathers this CUBE_S1 panel with a strided GM-to-L1 load.
+        using PLoadGlobal =
+            GlobalTensor<half, pto::Shape<1, 1, 1, Cube_S0, Cube_S1>, pto::Stride<1, 1, 1, Tile_S1, 1>>;
         const uint32_t buf_idx = static_cast<uint32_t>(tile_id % QKP_CV_FIFO);
         const size_t base_elems =
             static_cast<size_t>(buf_idx) * static_cast<size_t>(Cube_S0) * static_cast<size_t>(Tile_S1) +
-            static_cast<size_t>(sub_tile_id) * static_cast<size_t>(Cube_S0) * static_cast<size_t>(Cube_S1);
+            static_cast<size_t>(sub_tile_id) * static_cast<size_t>(Cube_S1);
         PLoadGlobal pLoadGlobal(p_tile_fifo + base_elems);
         TLOAD(pMatTile, pLoadGlobal);
         if (finishes_logical_tile) {
@@ -538,17 +541,12 @@ AICORE inline void compute_p(int tile_id, int row_slice, __gm__ float *exp_max_i
         if (row_slice == 0) {
             cv_wait_fifo_room<BUF1_SV_CONSUMED, QKP_CV_FIFO>(tile_id);
         }
-        using PStoreGlobal = GlobalTensor<half, pto::Shape<1, 1, 1, Vec_S0, Cube_S1>, pto::Stride<1, 1, 1, Cube_S1, 1>>;
-        using TileDataHSub = Tile<TileType::Vec, half, Vec_S0, Tile_S1, BLayout::RowMajor, Vec_S0, Cube_S1>;
-        __gm__ half *p_ptr = p_tile_fifo + qk_base_elems + row_offset * static_cast<size_t>(Cube_S1);
-        for (int sub_col = 0; sub_col < static_cast<int>(kTileFactor); ++sub_col) {
-            PStoreGlobal pStoreGlobal(p_ptr + static_cast<size_t>(sub_col) * static_cast<size_t>(Cube_S0) *
-                                                  static_cast<size_t>(Cube_S1));
-            TileDataHSub xExpSub;
-            TASSIGN(xExpSub, (uint64_t)x_expT.data() +
-                                 static_cast<uint64_t>(sub_col) * static_cast<uint64_t>(Cube_S1) * sizeof(half));
-            TSTORE(pStoreGlobal, xExpSub);
-        }
+        using PStoreGlobal =
+            GlobalTensor<half, pto::Shape<1, 1, 1, Vec_S0, Tile_S1>, pto::Stride<1, 1, 1, Tile_S1, 1>>;
+        const size_t p_base_elems = static_cast<size_t>(qk_buf_idx) * static_cast<size_t>(Cube_S0) *
+                                    static_cast<size_t>(Tile_S1);
+        PStoreGlobal pStoreGlobal(p_tile_fifo + p_base_elems + row_offset * static_cast<size_t>(Tile_S1));
+        TSTORE(pStoreGlobal, x_expT);
         if (row_slice == static_cast<int>(kTileFactor) - 1) {
             cv_signal<PIPE_MTE3, BUF1_SM_READY>();
         }
