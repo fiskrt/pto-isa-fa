@@ -658,12 +658,13 @@ AICORE inline void compute_gu(int tile_id, int num_tiles, __gm__ float *o_out, _
 
 template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1, int QK_PRELOAD, int CV_FIFO_SIZE,
           bool INTERMEDIATE_CHECK, bool CAUSAL_MASK, int CV_FIFO_CONS_SYNC_PERIOD>
-AICORE inline void runTFABodyRuntime(int s0, int s1, __gm__ uint64_t *ffts_addr, __gm__ half *q, __gm__ half *k,
-                                     __gm__ half *v, __gm__ half *p_tile_fifo, __gm__ float *exp_max_ififo,
-                                     __gm__ float *global_sum_out, __gm__ float *exp_max_out, __gm__ float *o_out,
-                                     __gm__ float *o_parts_out, __gm__ float *qk_tile_fifo,
-                                     __gm__ float *pv_tile_fifo, __gm__ uint8_t *cv_comm_buf,
-                                     __gm__ uint8_t *profile_buf)
+AICORE inline void runTFABodyRuntime(int s0, int s1, int total_q_heads, int q_heads_per_batch,
+                                     int kv_heads_per_batch, int n_rep, __gm__ uint64_t *ffts_addr, __gm__ half *q,
+                                     __gm__ half *k, __gm__ half *v, __gm__ half *p_tile_fifo,
+                                     __gm__ float *exp_max_ififo, __gm__ float *global_sum_out,
+                                     __gm__ float *exp_max_out, __gm__ float *o_out, __gm__ float *o_parts_out,
+                                     __gm__ float *qk_tile_fifo, __gm__ float *pv_tile_fifo,
+                                     __gm__ uint8_t *cv_comm_buf, __gm__ uint8_t *profile_buf)
 {
     uint64_t tStart = get_sys_cnt();
 
@@ -772,18 +773,45 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, __gm__ uint64_t *ffts_addr,
         pvVecTile, runningOTile, guScratch, triu);
 
     const int physical_block_idx = get_block_idx();
-    // Assign descending S0 blocks in alternating directions across the cores. Two complete waves pair
-    // expensive bottom blocks with cheap top blocks exactly; a partial wave is folded back onto the
-    // least-loaded end of the preceding wave. This gives one schedule for causal and dense attention,
-    // including block counts that are not multiples of 2 * kFaLaunchCores.
+    // Multi-head schedule (Stage 1: MHA + GQA/MQA via kv-head index map).
+    //
+    // The work axis is flattened over all (flat_q_head, S0-block) pairs: total_units =
+    // total_q_heads * block_rows, where total_q_heads = B * Hq. Within each head we keep the
+    // descending-S0 serpentine (expensive bottom blocks paired with cheap top blocks across two
+    // waves); folding heads onto the same axis keeps all kFaLaunchCores busy even when a single
+    // head has block_rows < kFaLaunchCores (short sequences), and drives the per-head causal
+    // quantization error toward zero as the head count grows.
+    //
+    // For GQA/MQA the G = n_rep query heads of a group share one kv head, so the kv slab is found
+    // by index math (flat_kv_head below) with no duplicated KV materialized in GM.
+    //
+    // NOTE(Sq != S): the causal masking in compute_qk/compute_p/compute_pv treats the S0 row index
+    // and S1 col index as sharing one origin -- i.e. it assumes Sq == S (query rows and key cols
+    // aligned at position 0). Decode/prefix shapes where Sq < S need a query offset of (S - Sq)
+    // added to the row position before masking. Not handled yet -- revisit when adding Sq != S.
+    const int total_units = total_q_heads * static_cast<int>(block_rows);
     for (int schedule_wave = 0;; ++schedule_wave) {
     const int position_in_wave = ((schedule_wave & 1) == 0) ?
                                      physical_block_idx :
                                      (kFaLaunchCores - 1 - physical_block_idx);
-    const int descending_rank = schedule_wave * kFaLaunchCores + position_in_wave;
-    if (descending_rank >= static_cast<int>(block_rows))
+    const int global_rank = schedule_wave * kFaLaunchCores + position_in_wave;
+    if (global_rank >= total_units)
         break;
-    const int block_idx = static_cast<int>(block_rows) - 1 - descending_rank;
+    const int rank_in_head = global_rank % static_cast<int>(block_rows);
+    const int block_idx = static_cast<int>(block_rows) - 1 - rank_in_head;
+    // Decode the flat query head and the kv head it reads (GQA/MQA: kv head shared by n_rep q heads).
+    const int flat_q_head = global_rank / static_cast<int>(block_rows);
+    const int batch_idx = flat_q_head / q_heads_per_batch;
+    const int q_head_in_batch = flat_q_head % q_heads_per_batch;
+    const int flat_kv_head = batch_idx * kv_heads_per_batch + q_head_in_batch / n_rep;
+    __gm__ half *q_head = q + static_cast<size_t>(flat_q_head) * static_cast<size_t>(s0) *
+                                  static_cast<size_t>(HEAD_SIZE);
+    __gm__ half *k_head = k + static_cast<size_t>(flat_kv_head) * static_cast<size_t>(s1) *
+                                  static_cast<size_t>(HEAD_SIZE);
+    __gm__ half *v_head = v + static_cast<size_t>(flat_kv_head) * static_cast<size_t>(s1) *
+                                  static_cast<size_t>(HEAD_SIZE);
+    __gm__ float *o_out_head = o_out + static_cast<size_t>(flat_q_head) * static_cast<size_t>(s0) *
+                                           static_cast<size_t>(HEAD_SIZE);
     tStart = get_sys_cnt();
     assign_running_acc_tile(qkAccTile, 0);
     assign_running_acc_tile(pvAccTile, 1);
@@ -814,12 +842,15 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, __gm__ uint64_t *ffts_addr,
     const size_t pv_fifo_block_stride =
         static_cast<size_t>(pv_tile_fifo_size) * static_cast<size_t>(Cube_S0) * static_cast<size_t>(HEAD_SIZE);
 
-    __gm__ half *q_block = q + block_offset_rows * HEAD_SIZE;
+    __gm__ half *q_block = q_head + block_offset_rows * HEAD_SIZE;
     __gm__ half *p_tile_fifo_block = p_tile_fifo + static_cast<size_t>(comm_slot) * p_fifo_block_stride;
     __gm__ float *exp_max_ififo_block = exp_max_ififo + static_cast<size_t>(comm_slot) * p_max_fifo_block_stride;
+    // NOTE: global_sum_out / exp_max_out / o_parts_out are debug/split-K scratch (only written under
+    // INTERMEDIATE_CHECK, which is false in all current builds). They are NOT offset per head, so they
+    // would alias across heads if ever enabled with multi-head -- size/offset them per head first.
     __gm__ float *global_sum_block = global_sum_out + block_offset_rows;
     __gm__ float *exp_max_block = exp_max_out + block_offset_rows;
-    __gm__ float *o_out_block = o_out + static_cast<size_t>(block_offset_rows) * static_cast<size_t>(HEAD_SIZE);
+    __gm__ float *o_out_block = o_out_head + static_cast<size_t>(block_offset_rows) * static_cast<size_t>(HEAD_SIZE);
     __gm__ float *o_parts_block = o_parts_out + static_cast<size_t>(block_offset_rows) * static_cast<size_t>(HEAD_SIZE);
     __gm__ float *qk_tile_fifo_block = qk_tile_fifo + static_cast<size_t>(comm_slot) * qk_fifo_block_stride;
     __gm__ float *pv_tile_fifo_block = pv_tile_fifo + static_cast<size_t>(comm_slot) * pv_fifo_block_stride;
@@ -857,7 +888,7 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, __gm__ uint64_t *ffts_addr,
                 assign_running_acc_tile(qkAccTile);
                 compute_qk<HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, qkp_tile_fifo_size, CV_FIFO_CONS_SYNC_PERIOD,
                            INTERMEDIATE_CHECK, CAUSAL_MASK>(
-                    seed_tile, sub_tile, q_block, k, qk_tile_fifo_block, qMatTile[0],
+                    seed_tile, sub_tile, q_block, k_head, qk_tile_fifo_block, qMatTile[0],
                     kMatTile[k_src_pingpong_id % kMatTNBuffers], qkAccTile,
                     k_src_pingpong_id % kMatTNBuffers, block_idx);
                 k_src_pingpong_id++;
@@ -892,7 +923,7 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, __gm__ uint64_t *ffts_addr,
                     assign_running_acc_tile(qkAccTile);
                     compute_qk<HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, qkp_tile_fifo_size, CV_FIFO_CONS_SYNC_PERIOD,
                                INTERMEDIATE_CHECK, CAUSAL_MASK>(
-                        qk_tile, sub_tile, q_block, k, qk_tile_fifo_block, qMatTile[0],
+                        qk_tile, sub_tile, q_block, k_head, qk_tile_fifo_block, qMatTile[0],
                         kMatTile[k_src_pingpong_id % kMatTNBuffers], qkAccTile,
                         k_src_pingpong_id % kMatTNBuffers, block_idx);
                     k_src_pingpong_id++;
@@ -921,7 +952,7 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, __gm__ uint64_t *ffts_addr,
                 for (int sub_tile = 0; sub_tile < static_cast<int>(kTileFactor); ++sub_tile) {
                     compute_pv<HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, qkp_tile_fifo_size, pv_tile_fifo_size,
                                CV_FIFO_CONS_SYNC_PERIOD, INTERMEDIATE_CHECK, CAUSAL_MASK>(
-                        pv_tile, sub_tile, v, p_tile_fifo_block, pv_tile_fifo_block,
+                        pv_tile, sub_tile, v_head, p_tile_fifo_block, pv_tile_fifo_block,
                         pMatTile[pv_src_pingpong_id % pMatTNBuffers], vMatTile[pv_src_pingpong_id % vMatTNBuffers],
                         pvAccTile, pv_src_pingpong_id % vMatTNBuffers + PV_EVENT_ID0, block_idx);
                     pv_src_pingpong_id++;
@@ -981,22 +1012,25 @@ __global__ AICORE __attribute__((aic)) void warmup_kernel()
 
 template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1, int QK_PRELOAD, int CV_FIFO_SIZE,
           bool INTERMEDIATE_CHECK, bool CAUSAL_MASK, int CV_FIFO_CONS_SYNC_PERIOD>
-__global__ AICORE void runTFATemplate(int s0, int s1, __gm__ uint64_t *ffts_addr, __gm__ half *q, __gm__ half *k,
-                                      __gm__ half *v, __gm__ half *p_tile_fifo, __gm__ float *exp_max_ififo,
-                                      __gm__ float *global_sum_out, __gm__ float *exp_max_out,
-                                      __gm__ float *o_out, __gm__ float *o_parts_out,
+__global__ AICORE void runTFATemplate(int s0, int s1, int total_q_heads, int q_heads_per_batch,
+                                      int kv_heads_per_batch, int n_rep, __gm__ uint64_t *ffts_addr, __gm__ half *q,
+                                      __gm__ half *k, __gm__ half *v, __gm__ half *p_tile_fifo,
+                                      __gm__ float *exp_max_ififo, __gm__ float *global_sum_out,
+                                      __gm__ float *exp_max_out, __gm__ float *o_out, __gm__ float *o_parts_out,
                                       __gm__ float *qk_tile_fifo, __gm__ float *pv_tile_fifo,
                                       __gm__ uint8_t *cv_comm_buf, __gm__ uint8_t *profile_buf)
 {
     runTFABodyRuntime<HEAD_SIZE, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, CV_FIFO_SIZE, INTERMEDIATE_CHECK, CAUSAL_MASK,
-                      CV_FIFO_CONS_SYNC_PERIOD>(s0, s1, ffts_addr, q, k, v, p_tile_fifo, exp_max_ififo,
-                                                global_sum_out, exp_max_out, o_out, o_parts_out, qk_tile_fifo,
-                                                pv_tile_fifo, cv_comm_buf, profile_buf);
+                      CV_FIFO_CONS_SYNC_PERIOD>(s0, s1, total_q_heads, q_heads_per_batch, kv_heads_per_batch, n_rep,
+                                                ffts_addr, q, k, v, p_tile_fifo, exp_max_ififo, global_sum_out,
+                                                exp_max_out, o_out, o_parts_out, qk_tile_fifo, pv_tile_fifo,
+                                                cv_comm_buf, profile_buf);
 }
 
 template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1, int QK_PRELOAD, int CV_FIFO_SIZE,
           bool INTERMEDIATE_CHECK, bool CAUSAL_MASK, int CV_FIFO_CONS_SYNC_PERIOD>
-void LaunchTFA(int s0, int s1, uint16_t *ffts, aclFloat16 *q, aclFloat16 *k, aclFloat16 *v,
+void LaunchTFA(int s0, int s1, int total_q_heads, int q_heads_per_batch, int kv_heads_per_batch, int n_rep,
+               uint16_t *ffts, aclFloat16 *q, aclFloat16 *k, aclFloat16 *v,
                aclFloat16 *p_tile_fifo,
                float *exp_max_ififo, float *global_sum_out, float *exp_max_out, float *o_out, float *o_parts_out,
                float *qk_tile_fifo, float *pv_tile_fifo, uint8_t *profile_data, aclrtStream stream,
@@ -1008,19 +1042,28 @@ void LaunchTFA(int s0, int s1, uint16_t *ffts, aclFloat16 *q, aclFloat16 *k, acl
     assert(s0 % CUBE_S0 == 0);
     assert(s1 % CUBE_S1 == 0);
     assert(s1 % TILE_S1 == 0);
+    assert(total_q_heads > 0);
+    assert(q_heads_per_batch > 0);
+    assert(kv_heads_per_batch > 0);
+    assert(n_rep > 0);
+    assert(q_heads_per_batch == kv_heads_per_batch * n_rep); // Hq = n_rep * Hkv (GQA/MQA group size)
 
 
     // questionable if this is helpful
     const uint64_t q_tensor_bytes =
-        static_cast<uint64_t>(s0) * static_cast<uint64_t>(HEAD_SIZE) * sizeof(half);
+        static_cast<uint64_t>(s0) * static_cast<uint64_t>(HEAD_SIZE) * sizeof(half) *
+        static_cast<uint64_t>(total_q_heads);
+    const int total_kv_heads = (total_q_heads / q_heads_per_batch) * kv_heads_per_batch;
     const uint64_t kv_tensor_bytes =
-        static_cast<uint64_t>(s1) * static_cast<uint64_t>(HEAD_SIZE) * sizeof(half);
+        static_cast<uint64_t>(s1) * static_cast<uint64_t>(HEAD_SIZE) * sizeof(half) *
+        static_cast<uint64_t>(total_kv_heads);
     PTO_PREFETCH((__gm__ void *)q, q_tensor_bytes, stream);
     PTO_PREFETCH((__gm__ void *)k, kv_tensor_bytes, stream);
     PTO_PREFETCH((__gm__ void *)v, kv_tensor_bytes, stream);
 
     runTFATemplate<HEAD_SIZE, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, CV_FIFO_SIZE, INTERMEDIATE_CHECK, CAUSAL_MASK,
                    CV_FIFO_CONS_SYNC_PERIOD><<<kFaLaunchCores, nullptr, stream>>>(
-        s0, s1, (__gm__ uint64_t *)ffts, (half *)q, (half *)k, (half *)v, (half *)p_tile_fifo, exp_max_ififo,
+        s0, s1, total_q_heads, q_heads_per_batch, kv_heads_per_batch, n_rep, (__gm__ uint64_t *)ffts, (half *)q,
+        (half *)k, (half *)v, (half *)p_tile_fifo, exp_max_ififo,
         global_sum_out, exp_max_out, o_out, o_parts_out, qk_tile_fifo, pv_tile_fifo, cv_comm_buf, profile_data);
 }

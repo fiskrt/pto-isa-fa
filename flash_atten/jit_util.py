@@ -17,6 +17,7 @@ CV_FIFO_SIZE = 8
 CUBE_S1 = 128
 TILE_S1 = 256
 CV_COMM_SLOT_BYTES = 512
+FA_LAUNCH_CORES = 24  # must match kFaLaunchCores in fa2.h
 
 
 def torch_to_ctypes(t: torch.Tensor) -> ctypes.c_void_p:
@@ -139,7 +140,7 @@ def _render_kernel_source(case: TfaCase, kernel_cpp: Path) -> str:
 #include "{kernel_include}"
 
 template void LaunchTFA<{template_args}>(
-    int s0, int s1,
+    int s0, int s1, int total_q_heads, int q_heads_per_batch, int kv_heads_per_batch, int n_rep,
     uint16_t *ffts, aclFloat16 *q, aclFloat16 *k, aclFloat16 *v, aclFloat16 *p_tile_fifo,
     float *exp_max_ififo, float *global_sum_out, float *exp_max_out, float *o_out, float *o_parts_out,
     float *qk_tile_fifo, float *pv_tile_fifo, uint8_t *profile_data, aclrtStream stream, uint8_t *cv_comm_buf);
@@ -160,14 +161,16 @@ def _render_wrapper(case: TfaCase) -> str:
 
 extern "C" int call_kernel(void *stream, void *q, void *k, void *v, void *p_tile_fifo, void *exp_max_ififo,
                            void *global_sum_out, void *exp_max_out, void *o_out, void *o_parts_out,
-                           void *qk_tile_fifo, void *pv_tile_fifo, void *cv_comm_buf, int s0, int s1)
+                           void *qk_tile_fifo, void *pv_tile_fifo, void *cv_comm_buf, int s0, int s1,
+                           int total_q_heads, int q_heads_per_batch, int kv_heads_per_batch, int n_rep)
 {{
     uint64_t ffts = 0;
     uint32_t ffts_len = 0;
     rtGetC2cCtrlAddr(&ffts, &ffts_len);
 
     LaunchTFA<{template_args}>(
-        s0, s1, reinterpret_cast<uint16_t *>(ffts), reinterpret_cast<aclFloat16 *>(q),
+        s0, s1, total_q_heads, q_heads_per_batch, kv_heads_per_batch, n_rep,
+        reinterpret_cast<uint16_t *>(ffts), reinterpret_cast<aclFloat16 *>(q),
         reinterpret_cast<aclFloat16 *>(k), reinterpret_cast<aclFloat16 *>(v), reinterpret_cast<aclFloat16 *>(p_tile_fifo),
         reinterpret_cast<float *>(exp_max_ififo), reinterpret_cast<float *>(global_sum_out),
         reinterpret_cast<float *>(exp_max_out), reinterpret_cast<float *>(o_out),
@@ -224,7 +227,7 @@ def _wrapper_compile_command(wrapper_cpp: Path, kernel_lib_path: Path, lib_path:
     flags = [
         "-fPIC",
         "-shared",
-       # "-g",
+        #"-g",
         "-D_FORTIFY_SOURCE=2",
         "-O2",
         "-std=c++17",
@@ -325,24 +328,30 @@ class FlashTfa:
         for dep in self.lib_path.parent.glob("libflash_kernel_*.so"):
             ctypes.CDLL(str(dep), mode=ctypes.RTLD_GLOBAL)
         self.lib = ctypes.CDLL(str(self.lib_path), mode=ctypes.RTLD_GLOBAL)
-        self.lib.call_kernel.argtypes = [ctypes.c_void_p] * 13 + [ctypes.c_int, ctypes.c_int]
+        self.lib.call_kernel.argtypes = [ctypes.c_void_p] * 13 + [ctypes.c_int] * 6
         self.lib.call_kernel.restype = ctypes.c_int
         self._ws: dict[str, torch.Tensor | tuple[str, int, int, TfaCase]] = {}
 
-    def _alloc_workspace(self, device: torch.device, s0: int, s1: int) -> None:
-        key = (str(device), s0, s1, self.case)
+    def _alloc_workspace(self, device: torch.device, s0: int, s1: int, total_q_heads: int) -> None:
+        key = (str(device), s0, s1, total_q_heads, self.case)
         if self._ws.get("_key") == key:
             return
 
         case = self.case
         block_rows = s0 // case.cube_s0
         num_tiles = s1 // case.tile_s1
-        qk_elems = block_rows * CV_FIFO_SIZE * case.cube_s0 * case.tile_s1
-        pv_elems = block_rows * CV_FIFO_SIZE * case.cube_s0 * case.head_size
-        exp_max_elems = block_rows * CV_FIFO_SIZE * case.cube_s0
+        # The cross-core FIFOs are per-physical-core scratch indexed by comm_slot in [0, FA_LAUNCH_CORES),
+        # reused across every (head, S0-block) a core processes. Size by the number of active cores --
+        # min(FA_LAUNCH_CORES, total work units) -- which also covers short sequences where block_rows <
+        # FA_LAUNCH_CORES but heads still light up all cores.
+        n_fifo_slots = max(1, min(FA_LAUNCH_CORES, total_q_heads * block_rows))
+        qk_elems = n_fifo_slots * CV_FIFO_SIZE * case.cube_s0 * case.tile_s1
+        pv_elems = n_fifo_slots * CV_FIFO_SIZE * case.cube_s0 * case.head_size
+        exp_max_elems = n_fifo_slots * CV_FIFO_SIZE * case.cube_s0
+        # Debug/split-K scratch (only written under INTERMEDIATE_CHECK): single-head sized, not per head.
         stats_elems = num_tiles * s0
         o_parts_elems = num_tiles * s0 * case.head_size
-        cv_comm_bytes = block_rows * CV_COMM_SLOT_BYTES
+        cv_comm_bytes = n_fifo_slots * CV_COMM_SLOT_BYTES
 
         self._ws.clear()
         self._ws["_key"] = key
@@ -350,7 +359,7 @@ class FlashTfa:
         self._ws["exp_max_ififo"] = torch.empty(exp_max_elems, device=device, dtype=torch.float32)
         self._ws["global_sum_out"] = torch.empty(stats_elems, device=device, dtype=torch.float32)
         self._ws["exp_max_out"] = torch.empty(stats_elems, device=device, dtype=torch.float32)
-        self._ws["o_out"] = torch.empty((s0, case.head_size), device=device, dtype=torch.float32)
+        self._ws["o_out"] = torch.empty((total_q_heads, s0, case.head_size), device=device, dtype=torch.float32)
         self._ws["o_parts_out"] = torch.empty(o_parts_elems, device=device, dtype=torch.float32)
         self._ws["qk_tile_fifo"] = torch.empty(qk_elems, device=device, dtype=torch.float32)
         self._ws["pv_tile_fifo"] = torch.empty(pv_elems, device=device, dtype=torch.float32)
@@ -363,17 +372,36 @@ class FlashTfa:
         v: torch.Tensor,
         stream_ptr: ctypes.c_void_p | int | None = None, # todo: remove, always just get stream before call
     ) -> torch.Tensor:
+        """Multi-head attention in a single launch.
+
+        Accepts 4D BNSD tensors q[B, Hq, Sq, D], k/v[B, Hkv, S, D] with Hq % Hkv == 0 (GQA/MQA),
+        returning o[B, Hq, Sq, D]. 2D tensors (Sq, D) / (S, D) are still accepted as the B=Hq=Hkv=1
+        case. Note: causal currently assumes Sq == S (see the Sq != S note in fa2.cpp).
+        """
         case = self.case
-        if q.ndim != 2 or k.ndim != 2 or v.ndim != 2:
-            raise ValueError("q, k, and v must be 2D tensors")
-        s0 = q.shape[0]
-        s1 = k.shape[0]
-        if q.shape[1] != case.head_size:
-            raise ValueError(f"q head size must be {case.head_size}, got {q.shape[1]}")
-        if k.shape != (s1, case.head_size):
-            raise ValueError(f"k must have shape {(s1, case.head_size)}, got {tuple(k.shape)}")
-        if v.shape != (s1, case.head_size):
-            raise ValueError(f"v must have shape {(s1, case.head_size)}, got {tuple(v.shape)}")
+        squeeze_2d = q.ndim == 2
+        if squeeze_2d:
+            if k.ndim != 2 or v.ndim != 2:
+                raise ValueError("q, k, and v must all be 2D or all be 4D")
+            q = q[None, None]
+            k = k[None, None]
+            v = v[None, None]
+        if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+            raise ValueError("q, k, and v must be 4D BNSD tensors (or all 2D)")
+
+        b, q_heads, s0, d = q.shape
+        bk, kv_heads, s1, dk = k.shape
+        if d != case.head_size:
+            raise ValueError(f"q head size must be {case.head_size}, got {d}")
+        if (bk, dk) != (b, case.head_size) or tuple(k.shape) != (b, kv_heads, s1, case.head_size):
+            raise ValueError(f"k must have shape {(b, kv_heads, s1, case.head_size)}, got {tuple(k.shape)}")
+        if tuple(v.shape) != (b, kv_heads, s1, case.head_size):
+            raise ValueError(f"v must have shape {(b, kv_heads, s1, case.head_size)}, got {tuple(v.shape)}")
+        if q_heads % kv_heads != 0:
+            raise ValueError(f"q_heads ({q_heads}) must be divisible by kv_heads ({kv_heads})")
+        n_rep = q_heads // kv_heads
+        total_q_heads = b * q_heads
+
         case.validate_shape(s0, s1)
         if q.dtype != torch.float16 or k.dtype != torch.float16 or v.dtype != torch.float16:
             raise TypeError("q, k, and v must be float16 tensors")
@@ -382,7 +410,7 @@ class FlashTfa:
         if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
             raise ValueError("q, k, and v must be contiguous")
 
-        self._alloc_workspace(q.device, s0, s1)
+        self._alloc_workspace(q.device, s0, s1, total_q_heads)
         if stream_ptr is None:
             stream_ptr = torch.npu.current_stream()._as_parameter_
         if not isinstance(stream_ptr, ctypes.c_void_p):
@@ -405,10 +433,15 @@ class FlashTfa:
             torch_to_ctypes(ws["cv_comm_buf"]),
             ctypes.c_int(s0),
             ctypes.c_int(s1),
+            ctypes.c_int(total_q_heads),
+            ctypes.c_int(q_heads),
+            ctypes.c_int(kv_heads),
+            ctypes.c_int(n_rep),
         )
         if ret != 0:
             raise RuntimeError(f"call_kernel failed with status {ret}")
-        return ws["o_out"]
+        out = ws["o_out"].view(b, q_heads, s0, case.head_size)
+        return out[0, 0] if squeeze_2d else out
 
 
 def jit_compile_flash(

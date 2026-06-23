@@ -90,17 +90,10 @@ def bench_callable(fn, args):
     return us
 
 
-def make_ptoisa_runner(flash, q, k, v, output, q_heads, kv_heads):
-    n_rep = q_heads // kv_heads
-    b = q.shape[0]
-
+def make_ptoisa_runner(flash, q, k, v, q_heads, kv_heads):
+    # Single launch handles all B*Hq heads (GQA/MQA via kv-head index map inside the kernel).
     def run_once():
-        for batch_idx in range(b):
-            for q_head_idx in range(q_heads):
-                kv_head_idx = q_head_idx // n_rep
-                out = flash(q[batch_idx, q_head_idx], k[batch_idx, kv_head_idx], v[batch_idx, kv_head_idx])
-                output[batch_idx, q_head_idx].copy_(out)
-        return output
+        return flash(q, k, v)
 
     return run_once
 

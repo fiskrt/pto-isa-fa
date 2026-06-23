@@ -57,7 +57,6 @@ def main() -> None:
     q = torch.randn(bsz, q_heads, q_len, head_size, dtype=torch.float16)
     k = torch.randn(bsz, kv_heads, s_len, head_size, dtype=torch.float16)
     v = torch.randn(bsz, kv_heads, s_len, head_size, dtype=torch.float16)
-    output = torch.empty(bsz, q_heads, q_len, head_size, dtype=torch.float32)
     print("init successful!")
 
     flash = jit_compile_flash(
@@ -70,12 +69,8 @@ def main() -> None:
         verbose=args.verbose_jit,
     )
 
-    n_rep = q_heads // kv_heads
-    for batch_idx in range(bsz):
-        for q_head_idx in range(q_heads):
-            kv_head_idx = q_head_idx // n_rep
-            out = flash(q[batch_idx, q_head_idx], k[batch_idx, kv_head_idx], v[batch_idx, kv_head_idx])
-            output[batch_idx, q_head_idx].copy_(out)
+    # Single launch handles all B*Hq heads (GQA/MQA via kv-head index map inside the kernel).
+    output = flash(q, k, v)
 
     torch.npu.synchronize()
 

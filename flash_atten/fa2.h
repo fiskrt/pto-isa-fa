@@ -28,7 +28,8 @@ constexpr int VEC_CORES = 2; // Default to 2 vector cores per cube
 template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1 = kFaCubeS1, int TILE_S1 = kFaTileS1,
           int QK_PRELOAD = kFaQkPreload, int CV_FIFO_SIZE = kFaCvFifoSize, bool INTERMEDIATE_CHECK = false,
           bool CAUSAL_MASK = false, int CV_FIFO_CONS_SYNC_PERIOD = kFaCvFifoConsSyncPeriod>
-void LaunchTFA(int s0, int s1, uint16_t *ffts, aclFloat16 *q, aclFloat16 *k, aclFloat16 *v,
+void LaunchTFA(int s0, int s1, int total_q_heads, int q_heads_per_batch, int kv_heads_per_batch, int n_rep,
+               uint16_t *ffts, aclFloat16 *q, aclFloat16 *k, aclFloat16 *v,
                aclFloat16 *p_tile_fifo,
                float *exp_max_ififo, float *global_sum_out, float *exp_max_out, float *o_out, float *o_parts_out,
                float *qk_tile_fifo, float *pv_tile_fifo, uint8_t *profile_data, aclrtStream stream,
