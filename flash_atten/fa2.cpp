@@ -27,12 +27,13 @@ using namespace pto;
 // Buffer flag values for FFTS pipeline coordination
 enum FftsBufferFlag : uint32_t
 {
-    BUF0_QK_READY = 0,    // Buffer 0: QK data ready
+    BUF0_QK_READY = 0,    // Even logical QK tile: one credit per ready Cube_S1 panel
     BUF0_SM_CONSUMED = 1, // Buffer 0: Softmax consumed
     BUF1_SM_READY = 2,    // Buffer 1: Softmax output ready
     BUF1_SV_CONSUMED = 3, // Buffer 1: SV consumed
     UPDATE_READY = 4,     // Update stage ready
     UPDATE_CONSUMED = 5,  // Update stage consumed
+    BUF0_QK_READY_ALT = 6, // Odd logical QK tile: one credit per ready Cube_S1 panel
     CV_BLOCK_END = 7,     // CV comm slot block end (CV_COMM_CTRL reserved in TSyncCVID)
 };
 #endif
@@ -76,6 +77,28 @@ template <pipe_t SignalPipe, uint16_t FlagID>
 AICORE PTO_INLINE void cv_signal()
 {
     ffts_cross_core_sync(SignalPipe, _getFFTSMsg(CV_CORE_SYNC, FlagID));
+}
+
+// A device semaphore is a four-bit counter. Keep adjacent logical tiles on
+// different counters so TILE_S1/CUBE_S1 panel credits cannot overflow or be
+// consumed by the wrong tile while Cube runs ahead of Vec.
+AICORE PTO_INLINE void cv_wait_qk_panel(int tile_id)
+{
+    if ((tile_id & 1) == 0) {
+        cv_wait<BUF0_QK_READY>();
+    } else {
+        cv_wait<BUF0_QK_READY_ALT>();
+    }
+}
+
+template <pipe_t SignalPipe>
+AICORE PTO_INLINE void cv_signal_qk_panel(int tile_id)
+{
+    if ((tile_id & 1) == 0) {
+        cv_signal<SignalPipe, BUF0_QK_READY>();
+    } else {
+        cv_signal<SignalPipe, BUF0_QK_READY_ALT>();
+    }
 }
 
 template <uint16_t FreeFlagID, int FifoDepth>
@@ -297,6 +320,7 @@ AICORE inline void compute_qk(int tile_id, int sub_tile_id, __gm__ half *q, __gm
         constexpr int QKP_CV_FIFO = CV_FIFO_SIZE;
         static_assert(QKP_CV_FIFO >= 1, "QKP_CV_FIFO must be >= 1");
         static_assert(Tile_S1 % Cube_S1 == 0, "TILE_S1 must be divisible by CUBE_S1");
+        static_assert(kTileFactor <= 15, "QK panel-ready credits must fit the four-bit device semaphore");
 
         const int s0_index = blk_idx * CUBE_S0;
         const int s1_index = tile_id * static_cast<int>(Tile_S1) + sub_tile_id * static_cast<int>(Cube_S1);
@@ -308,9 +332,9 @@ AICORE inline void compute_qk(int tile_id, int sub_tile_id, __gm__ half *q, __gm
             if (s1_index > block_last_s0) {
                 // This QK subtile is future-masked for every row in the block.
                 // compute_p initializes the vector tile to -inf before loading active subtiles.
-                if (sub_tile_id == static_cast<int>(kTileFactor) - 1) {
-                    cv_signal<PIPE_FIX, BUF0_QK_READY>();
-                }
+                // Still publish one credit so compute_p consumes exactly kTileFactor
+                // credits for every logical tile, including causal tail panels.
+                cv_signal_qk_panel<PIPE_FIX>(tile_id);
                 return;
             }
         }
@@ -346,10 +370,8 @@ AICORE inline void compute_qk(int tile_id, int sub_tile_id, __gm__ half *q, __gm
             static_cast<size_t>(sub_tile_id) * static_cast<size_t>(Cube_S0) * static_cast<size_t>(Cube_S1);
         QKStoreGlobal qkStoreGlobal(qk_tile_fifo + base_elems);
         TSTORE<STPhase::Final>(qkStoreGlobal, qkAccTile);
-
-        if (sub_tile_id == static_cast<int>(kTileFactor) - 1) {
-            cv_signal<PIPE_FIX, BUF0_QK_READY>();
-        }
+        // PIPE_FIX orders the semaphore credit after this panel's GM store.
+        cv_signal_qk_panel<PIPE_FIX>(tile_id);
     }
 }
 
@@ -449,6 +471,7 @@ AICORE inline void compute_p(int tile_id, int row_slice, __gm__ float *exp_max_i
     constexpr int QKP_CV_FIFO = CV_FIFO_SIZE;
     static_assert(QKP_CV_FIFO >= 1, "QKP_CV_FIFO must be >= 1");
     static_assert(Tile_S1 % Cube_S1 == 0, "TILE_S1 must be divisible by CUBE_S1");
+    static_assert(kTileFactor <= 15, "QK panel-ready credits must fit the four-bit device semaphore");
     static_assert(Cube_S0 % (VEC_CORES * kTileFactor) == 0, "Vec rows must divide evenly across tile slices");
     const bool initFlag = (tile_id == 0);
     if constexpr (DAV_VEC) {
@@ -459,10 +482,6 @@ AICORE inline void compute_p(int tile_id, int row_slice, __gm__ float *exp_max_i
         const int s0_index = blk_idx * Cube_S0 + row_offset;
         const int s1_index = tile_id * static_cast<int>(Tile_S1);
         wait_flag(PIPE_V, PIPE_MTE2, pTileEventId);
-
-        if (row_slice == 0) {
-            cv_wait<BUF0_QK_READY>();
-        }
 
         const uint32_t qk_buf_idx = static_cast<uint32_t>(tile_id % QKP_CV_FIFO);
         const size_t qk_base_elems = static_cast<size_t>(qk_buf_idx) * static_cast<size_t>(kTileFactor) *
@@ -484,6 +503,12 @@ AICORE inline void compute_p(int tile_id, int row_slice, __gm__ float *exp_max_i
             }
         }
         for (int sub_col = 0; sub_col < static_cast<int>(kTileFactor); ++sub_col) {
+            // Only the first row slice consumes readiness credits. Once it has
+            // consumed all kTileFactor credits, every panel is persistent in
+            // this tile's GM FIFO slot and the remaining row slices can load it.
+            if (row_slice == 0) {
+                cv_wait_qk_panel(tile_id);
+            }
             TileDataFSub qkVecSub;
             TASSIGN(qkVecSub, (uint64_t)qkVecTile.data() +
                                   static_cast<uint64_t>(sub_col) * static_cast<uint64_t>(Cube_S1) * sizeof(float));
@@ -659,8 +684,22 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, __gm__ uint64_t *ffts_addr,
     // --------------------------
     // Tuning knobs (pipeline)
     //
-    // QK_PRELOAD remains a template argument for host/JIT compatibility, but the scheduler uses a fixed
-    // one-tile lookahead instead of building a multi-tile backlog before starting PV.
+    // QK_LOOKAHEAD: how many QK tiles the Cube runs ahead of the PV it interleaves with. With a value of
+    // N the Cube produces QK(0..N-1) before its first PV, then sustains QK(k+N) || PV(k). This hides the
+    // QK->P latency: by the time Vec reaches P(m), QK(m) was produced ~N-1 PV-durations earlier instead of
+    // just-in-time behind a PV on the single Cube core (which otherwise leaves a Vec bubble before P(m)).
+    // Driven by the --qk-preload knob (template arg QK_PRELOAD). N=1 reproduces the old one-tile schedule.
+    constexpr int QK_LOOKAHEAD = QK_PRELOAD;
+    static_assert(QK_LOOKAHEAD >= 1, "QK_LOOKAHEAD (qk_preload) must be >= 1");
+    static_assert(QK_LOOKAHEAD < CV_FIFO_SIZE, "QK FIFO must hold QK_LOOKAHEAD+1 in-flight tiles");
+
+    // GU_LAG: how many tiles GU runs *behind* the PV that feeds it. PV(k) output must be in the pv_tile_fifo
+    // by the time GU(k) runs; with lag L, GU(k) gets L phases of slack to hide the PV->GU cross-core latency
+    // (the old schedule used L=1, giving GU only one phase of slack -> Vec stalled on GU between P stages).
+    // Bounded by the PV FIFO depth (CV_FIFO_SIZE), not the QK panel semaphore. L=1 reproduces the old schedule.
+    constexpr int GU_LAG = 2;
+    static_assert(GU_LAG >= 1, "GU_LAG must be >= 1");
+    static_assert(GU_LAG < CV_FIFO_SIZE, "PV FIFO must hold GU_LAG in-flight PV outputs");
 
     // Buffer counts for optional double-buffering (default 1)
     // - srcVecTNBuffers/xexpVecTNBuffers: Vec ping-pong for QK load and x_exp output
@@ -810,22 +849,26 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, __gm__ uint64_t *ffts_addr,
     int k_src_pingpong_id = 0;    // separate ping-pong for K tiles
     int pv_src_pingpong_id = 0;   // separate ping-pong for P V tiles
 
-    // Seed QK(0). Vec enters the main loop immediately and computes P(0) while Cube advances to QK(1).
+    // Seed QK(0..QK_LOOKAHEAD-1). Vec enters the main loop immediately and computes P(0) while Cube has
+    // already produced these tiles, so P never waits for a QK queued behind a PV on the single Cube core.
     if constexpr (DAV_CUBE) {
-        for (int sub_tile = 0; sub_tile < static_cast<int>(kTileFactor); ++sub_tile) {
-            assign_running_acc_tile(qkAccTile);
-            compute_qk<HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, qkp_tile_fifo_size, CV_FIFO_CONS_SYNC_PERIOD,
-                       INTERMEDIATE_CHECK, CAUSAL_MASK>(
-                0, sub_tile, q_block, k, qk_tile_fifo_block, qMatTile[0],
-                kMatTile[k_src_pingpong_id % kMatTNBuffers], qkAccTile,
-                k_src_pingpong_id % kMatTNBuffers, block_idx);
-            k_src_pingpong_id++;
+        for (int seed_tile = 0; seed_tile < QK_LOOKAHEAD && seed_tile < num_tiles_s1; ++seed_tile) {
+            for (int sub_tile = 0; sub_tile < static_cast<int>(kTileFactor); ++sub_tile) {
+                assign_running_acc_tile(qkAccTile);
+                compute_qk<HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, qkp_tile_fifo_size, CV_FIFO_CONS_SYNC_PERIOD,
+                           INTERMEDIATE_CHECK, CAUSAL_MASK>(
+                    seed_tile, sub_tile, q_block, k, qk_tile_fifo_block, qMatTile[0],
+                    kMatTile[k_src_pingpong_id % kMatTNBuffers], qkAccTile,
+                    k_src_pingpong_id % kMatTNBuffers, block_idx);
+                k_src_pingpong_id++;
+            }
         }
     }
 
-    // Alternate the two engines after the seed:
-    //   QK(1) || P(0), PV(0) || P(1), QK(2) || GU(0), PV(1) || P(2), ...
-    const int pipeline_phases = 2 * num_tiles_s1 + 1;
+    // Alternate the two engines after the seed (shown for QK_LOOKAHEAD=2, GU_LAG=2):
+    //   QK(2)||P(0), PV(0)||P(1), QK(3)||--, PV(1)||P(2), QK(4)||GU(0), PV(2)||P(3), QK(5)||GU(1), ...
+    // GU(k) runs at phase 2k+2*GU_LAG, so the tail needs 2*(GU_LAG-1) extra phases for GU to drain.
+    const int pipeline_phases = 2 * num_tiles_s1 - 1 + 2 * GU_LAG;
     for (int phase = 0; phase < pipeline_phases; ++phase) {
         int qk_tile = -1;
         int p_tile = -1;
@@ -833,14 +876,14 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, __gm__ uint64_t *ffts_addr,
         int gu_tile = -1;
 
         if (phase == 0) {
-            qk_tile = 1;
+            qk_tile = QK_LOOKAHEAD;
             p_tile = 0;
         } else if ((phase & 1) != 0) {
             pv_tile = (phase - 1) / 2;
             p_tile = (phase + 1) / 2;
         } else {
-            qk_tile = phase / 2 + 1;
-            gu_tile = phase / 2 - 1;
+            qk_tile = phase / 2 + QK_LOOKAHEAD;
+            gu_tile = phase / 2 - GU_LAG;
         }
 
         if constexpr (DAV_CUBE) {
