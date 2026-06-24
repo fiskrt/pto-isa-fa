@@ -634,8 +634,8 @@ AICORE inline void compute_gu(int tile_id, int num_tiles, __gm__ float *o_out, _
 template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1, int QK_PRELOAD, int CV_FIFO_SIZE,
           bool INTERMEDIATE_CHECK, bool CAUSAL_MASK, int CV_FIFO_CONS_SYNC_PERIOD>
 AICORE inline void runTFABodyRuntime(int s0, int s1, int total_q_heads, int q_heads_per_batch,
-                                     int kv_heads_per_batch, int n_rep, __gm__ uint64_t *ffts_addr, __gm__ half *q,
-                                     __gm__ half *k, __gm__ half *v, __gm__ half *p_tile_fifo,
+                                     int kv_heads_per_batch, int n_rep, int launch_cores, __gm__ uint64_t *ffts_addr,
+                                     __gm__ half *q, __gm__ half *k, __gm__ half *v, __gm__ half *p_tile_fifo,
                                      __gm__ float *exp_max_ififo, __gm__ float *global_sum_out,
                                      __gm__ float *exp_max_out, __gm__ float *o_out, __gm__ float *o_parts_out,
                                      __gm__ float *qk_tile_fifo, __gm__ float *pv_tile_fifo,
@@ -754,12 +754,19 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, int total_q_heads, int q_he
     // and S1 col index as sharing one origin -- i.e. it assumes Sq == S (query rows and key cols
     // aligned at position 0). Decode/prefix shapes where Sq < S need a query offset of (S - Sq)
     // added to the row position before masking. Not handled yet -- revisit when adding Sq != S.
+    // launch_cores is the runtime grid width chosen by the host (LaunchTFA): the smallest core count
+    // that still drains total_units in the minimum number of waves (ceil(units / kFaLaunchCores)).
+    // For small problems (few heads x short seq) this is < kFaLaunchCores, so each core processes more
+    // (head, S0-block) units. That removes the idle tail wave AND improves K/V locality: the serpentine
+    // hands each core a descending-then-ascending block_idx pair within a head, and under causal masking
+    // a smaller block_idx reads a strict prefix of the K/V tiles the larger one already streamed, so the
+    // second pass hits in L2. For large problems the formula returns kFaLaunchCores (all cores busy).
     const int total_units = total_q_heads * static_cast<int>(block_rows);
     for (int schedule_wave = 0;; ++schedule_wave) {
     const int position_in_wave = ((schedule_wave & 1) == 0) ?
                                      physical_block_idx :
-                                     (kFaLaunchCores - 1 - physical_block_idx);
-    const int global_rank = schedule_wave * kFaLaunchCores + position_in_wave;
+                                     (launch_cores - 1 - physical_block_idx);
+    const int global_rank = schedule_wave * launch_cores + position_in_wave;
     if (global_rank >= total_units)
         break;
     const int rank_in_head = global_rank % static_cast<int>(block_rows);
@@ -974,8 +981,8 @@ __global__ AICORE __attribute__((aic)) void warmup_kernel()
 template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1, int QK_PRELOAD, int CV_FIFO_SIZE,
           bool INTERMEDIATE_CHECK, bool CAUSAL_MASK, int CV_FIFO_CONS_SYNC_PERIOD>
 __global__ AICORE void runTFATemplate(int s0, int s1, int total_q_heads, int q_heads_per_batch,
-                                      int kv_heads_per_batch, int n_rep, __gm__ uint64_t *ffts_addr, __gm__ half *q,
-                                      __gm__ half *k, __gm__ half *v, __gm__ half *p_tile_fifo,
+                                      int kv_heads_per_batch, int n_rep, int launch_cores, __gm__ uint64_t *ffts_addr,
+                                      __gm__ half *q, __gm__ half *k, __gm__ half *v, __gm__ half *p_tile_fifo,
                                       __gm__ float *exp_max_ififo, __gm__ float *global_sum_out,
                                       __gm__ float *exp_max_out, __gm__ float *o_out, __gm__ float *o_parts_out,
                                       __gm__ float *qk_tile_fifo, __gm__ float *pv_tile_fifo,
@@ -983,9 +990,9 @@ __global__ AICORE void runTFATemplate(int s0, int s1, int total_q_heads, int q_h
 {
     runTFABodyRuntime<HEAD_SIZE, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, CV_FIFO_SIZE, INTERMEDIATE_CHECK, CAUSAL_MASK,
                       CV_FIFO_CONS_SYNC_PERIOD>(s0, s1, total_q_heads, q_heads_per_batch, kv_heads_per_batch, n_rep,
-                                                ffts_addr, q, k, v, p_tile_fifo, exp_max_ififo, global_sum_out,
-                                                exp_max_out, o_out, o_parts_out, qk_tile_fifo, pv_tile_fifo,
-                                                cv_comm_buf, profile_buf);
+                                                launch_cores, ffts_addr, q, k, v, p_tile_fifo, exp_max_ififo,
+                                                global_sum_out, exp_max_out, o_out, o_parts_out, qk_tile_fifo,
+                                                pv_tile_fifo, cv_comm_buf, profile_buf);
 }
 
 template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1, int QK_PRELOAD, int CV_FIFO_SIZE,
@@ -1010,21 +1017,40 @@ void LaunchTFA(int s0, int s1, int total_q_heads, int q_heads_per_batch, int kv_
     assert(q_heads_per_batch == kv_heads_per_batch * n_rep); // Hq = n_rep * Hkv (GQA/MQA group size)
 
 
-    // questionable if this is helpful
-    const uint64_t q_tensor_bytes =
-        static_cast<uint64_t>(s0) * static_cast<uint64_t>(HEAD_SIZE) * sizeof(half) *
-        static_cast<uint64_t>(total_q_heads);
-    const int total_kv_heads = (total_q_heads / q_heads_per_batch) * kv_heads_per_batch;
-    const uint64_t kv_tensor_bytes =
-        static_cast<uint64_t>(s1) * static_cast<uint64_t>(HEAD_SIZE) * sizeof(half) *
-        static_cast<uint64_t>(total_kv_heads);
-    PTO_PREFETCH((__gm__ void *)q, q_tensor_bytes, stream);
-    PTO_PREFETCH((__gm__ void *)k, kv_tensor_bytes, stream);
-    PTO_PREFETCH((__gm__ void *)v, kv_tensor_bytes, stream);
+    // Pick the grid width: the fewest cores that still drain all (head, S0-block) work units in the
+    // minimum number of waves. waves = ceil(units / kFaLaunchCores); launch_cores = ceil(units / waves).
+    // This never adds a wave (so makespan cannot regress), but for small problems it shrinks the grid so
+    // each core does more units -- removing the idle tail wave and keeping K/V hot in L2 across the
+    // serpentine's block pairs (see runTFABodyRuntime). For large problems it resolves to kFaLaunchCores.
+    const int block_rows_host = s0 / CUBE_S0;
+    const int total_units = total_q_heads * block_rows_host;
+    int launch_cores = kFaLaunchCores;
+    if (total_units > 0) {
+        const int waves = (total_units + kFaLaunchCores - 1) / kFaLaunchCores;
+        launch_cores = (total_units + waves - 1) / waves;
+        if (launch_cores > kFaLaunchCores) launch_cores = kFaLaunchCores;
+        if (launch_cores < 1) launch_cores = 1;
+    }
+
+    // Prefetch q/k/v into L2 ahead of the kernel. This only pays off when the kernel runs long enough to
+    // hide the prefetch's HBM pass behind compute. For small (single-/few-wave) problems the prefetch is
+    // an extra serial HBM round-trip the kernel can't overlap, so it adds pure latency -- skip it there.
+    if (total_units > kFaLaunchCores) {
+        const uint64_t q_tensor_bytes =
+            static_cast<uint64_t>(s0) * static_cast<uint64_t>(HEAD_SIZE) * sizeof(half) *
+            static_cast<uint64_t>(total_q_heads);
+        const int total_kv_heads = (total_q_heads / q_heads_per_batch) * kv_heads_per_batch;
+        const uint64_t kv_tensor_bytes =
+            static_cast<uint64_t>(s1) * static_cast<uint64_t>(HEAD_SIZE) * sizeof(half) *
+            static_cast<uint64_t>(total_kv_heads);
+        PTO_PREFETCH((__gm__ void *)q, q_tensor_bytes, stream);
+        PTO_PREFETCH((__gm__ void *)k, kv_tensor_bytes, stream);
+        PTO_PREFETCH((__gm__ void *)v, kv_tensor_bytes, stream);
+    }
 
     runTFATemplate<HEAD_SIZE, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, CV_FIFO_SIZE, INTERMEDIATE_CHECK, CAUSAL_MASK,
-                   CV_FIFO_CONS_SYNC_PERIOD><<<kFaLaunchCores, nullptr, stream>>>(
-        s0, s1, total_q_heads, q_heads_per_batch, kv_heads_per_batch, n_rep, (__gm__ uint64_t *)ffts, (half *)q,
-        (half *)k, (half *)v, (half *)p_tile_fifo, exp_max_ififo,
+                   CV_FIFO_CONS_SYNC_PERIOD><<<launch_cores, nullptr, stream>>>(
+        s0, s1, total_q_heads, q_heads_per_batch, kv_heads_per_batch, n_rep, launch_cores, (__gm__ uint64_t *)ffts,
+        (half *)q, (half *)k, (half *)v, (half *)p_tile_fifo, exp_max_ififo,
         global_sum_out, exp_max_out, o_out, o_parts_out, qk_tile_fifo, pv_tile_fifo, cv_comm_buf, profile_data);
 }
