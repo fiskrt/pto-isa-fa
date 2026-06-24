@@ -796,17 +796,6 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, int total_q_heads, int q_he
     const int block_offset_rows = block_idx * static_cast<int>(Cube_S0);
 
     const int comm_slot = physical_block_idx;
-    __gm__ uint64_t *profile_entry = nullptr;
-    if (profile_buf != nullptr) {
-        std::size_t profile_block_base = static_cast<std::size_t>(block_idx) * kFaProfileBytesPerBlock;
-        std::size_t profile_offset = profile_block_base;
-        if constexpr (DAV_VEC) {
-            profile_offset +=
-                (static_cast<std::size_t>(get_subblockid()) + 1U) * 1024U; // vec subblock 0/1 use 2nd/3rd KB
-        }
-        profile_entry = reinterpret_cast<__gm__ uint64_t *>(profile_buf + profile_offset);
-        profile_entry[0] = tStart;
-    }
     const size_t p_fifo_block_stride =
         static_cast<size_t>(qkp_tile_fifo_size) * static_cast<size_t>(Cube_S0) * static_cast<size_t>(Tile_S1);
     const size_t p_max_fifo_block_stride = static_cast<size_t>(qkp_tile_fifo_size) * static_cast<size_t>(Cube_S0);
@@ -852,41 +841,30 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, int total_q_heads, int q_he
     int k_src_pingpong_id = 0;    // separate ping-pong for K tiles
     int pv_src_pingpong_id = 0;   // separate ping-pong for P V tiles
 
-    // Seed QK(0). Vec enters the main loop immediately and computes P(0) while Cube advances to QK(1).
-    if constexpr (DAV_CUBE) {
-        for (int sub_tile = 0; sub_tile < static_cast<int>(kTileFactor); ++sub_tile) {
-            assign_running_acc_tile(qkAccTile);
-            compute_qk<HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, qkp_tile_fifo_size, CV_FIFO_CONS_SYNC_PERIOD,
-                       INTERMEDIATE_CHECK, CAUSAL_MASK>(
-                0, sub_tile, q_block, k_head, qk_tile_fifo_block, qMatTile[0],
-                kMatTile[k_src_pingpong_id % kMatTNBuffers], qkAccTile,
-                k_src_pingpong_id % kMatTNBuffers, block_idx);
-            k_src_pingpong_id++;
-        }
-    }
-
-    // Alternate the two engines after the seed:
-    //   QK(1) || P(0), PV(0) || P(1), QK(2) || GU(0), PV(1) || P(2), ...
-    const int pipeline_phases = 2 * num_tiles_s1 + 1;
-    for (int phase = 0; phase < pipeline_phases; ++phase) {
-        int qk_tile = -1;
-        int p_tile = -1;
-        int pv_tile = -1;
-        int gu_tile = -1;
-
-        if (phase == 0) {
-            qk_tile = 1;
-            p_tile = 0;
-        } else if ((phase & 1) != 0) {
-            pv_tile = (phase - 1) / 2;
-            p_tile = (phase + 1) / 2;
-        } else {
-            qk_tile = phase / 2 + 1;
-            gu_tile = phase / 2 - 1;
-        }
+    // Unified software-pipelined schedule with a multi-tile lookahead.
+    //
+    // The hard dependency chain per tile is QK -> softmax(P) -> PV -> GU, with QK/PV on Cube and P/GU
+    // on Vec, handed off through GM FIFOs. With only a 1-tile lookahead the Cube finished QK(t) and
+    // then stalled waiting for Vec's softmax to produce P(t) before it could start PV(t) -- while Vec
+    // stalled waiting for QK(t) to land. We decouple QK production from PV consumption by LOOKAHEAD
+    // tiles, so by the time Cube needs PV(t) the softmax for P(t) finished several steps ago. The
+    // depth-CV_FIFO_SIZE qk/p GM FIFOs absorb the QK results produced ahead.
+    //
+    // Per step Cube issues QK(step) then PV(step-LOOKAHEAD); Vec issues GU(step-LOOKAHEAD-1) then
+    // P(step). Cube-QK-first unblocks Vec's P(step) as early as possible; Vec-GU-first lets Vec do the
+    // already-ready rescale work while Cube produces QK(step), hiding the cross-core QK->P latency.
+    // (GU lags PV by one step so its input PV tile is produced on the previous Cube step.)
+    constexpr int LOOKAHEAD = 3;
+    static_assert(CV_FIFO_SIZE >= LOOKAHEAD + 1, "qk/p GM FIFO must hold LOOKAHEAD+1 in-flight tiles");
+    const int pipeline_steps = num_tiles_s1 + LOOKAHEAD + 1;
+    for (int step = 0; step < pipeline_steps; ++step) {
+        const int qk_tile = step;
+        const int p_tile = step;
+        const int pv_tile = step - LOOKAHEAD;
+        const int gu_tile = step - LOOKAHEAD - 1;
 
         if constexpr (DAV_CUBE) {
-            if (qk_tile >= 0 && qk_tile < num_tiles_s1) {
+            if (qk_tile < num_tiles_s1) {
                 for (int sub_tile = 0; sub_tile < static_cast<int>(kTileFactor); ++sub_tile) {
                     assign_running_acc_tile(qkAccTile);
                     compute_qk<HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, qkp_tile_fifo_size, CV_FIFO_CONS_SYNC_PERIOD,
@@ -895,21 +873,6 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, int total_q_heads, int q_he
                         kMatTile[k_src_pingpong_id % kMatTNBuffers], qkAccTile,
                         k_src_pingpong_id % kMatTNBuffers, block_idx);
                     k_src_pingpong_id++;
-                }
-            }
-        }
-
-        if constexpr (DAV_VEC) {
-            if (p_tile >= 0 && p_tile < num_tiles_s1) {
-                for (int row_slice = 0; row_slice < static_cast<int>(kTileFactor); ++row_slice) {
-                    compute_p<HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, qkp_tile_fifo_size, CV_FIFO_CONS_SYNC_PERIOD,
-                              INTERMEDIATE_CHECK, CAUSAL_MASK>(
-                        p_tile, row_slice, exp_max_ififo_block, qk_tile_fifo_block, p_tile_fifo_block,
-                        global_sum_block, exp_max_block, qkVecTile[p_gu_src_pingpong_id % srcVecTNBuffers],
-                        x_expT[p_gu_src_pingpong_id % xexpVecTNBuffers], input_reduce_tmp, m1_local_max, l1_local_sum,
-                        m2_global_max, l2_global_sum, l1_exp_max_ififo[p_tile % qkp_tile_fifo_size], triu,
-                        p_gu_src_pingpong_id % xexpVecTNBuffers, block_idx);
-                    p_gu_src_pingpong_id++;
                 }
             }
         }
@@ -936,6 +899,21 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, int total_q_heads, int q_he
                     pvVecTile[p_gu_src_pingpong_id % outOTileNBuffers], l1_exp_max_ififo[gu_tile % qkp_tile_fifo_size],
                     l2_global_sum, guScratch, p_gu_src_pingpong_id % outOTileNBuffers);
                 p_gu_src_pingpong_id++;
+            }
+        }
+
+        if constexpr (DAV_VEC) {
+            if (p_tile < num_tiles_s1) {
+                for (int row_slice = 0; row_slice < static_cast<int>(kTileFactor); ++row_slice) {
+                    compute_p<HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, qkp_tile_fifo_size, CV_FIFO_CONS_SYNC_PERIOD,
+                              INTERMEDIATE_CHECK, CAUSAL_MASK>(
+                        p_tile, row_slice, exp_max_ififo_block, qk_tile_fifo_block, p_tile_fifo_block,
+                        global_sum_block, exp_max_block, qkVecTile[p_gu_src_pingpong_id % srcVecTNBuffers],
+                        x_expT[p_gu_src_pingpong_id % xexpVecTNBuffers], input_reduce_tmp, m1_local_max, l1_local_sum,
+                        m2_global_max, l2_global_sum, l1_exp_max_ififo[p_tile % qkp_tile_fifo_size], triu,
+                        p_gu_src_pingpong_id % xexpVecTNBuffers, block_idx);
+                    p_gu_src_pingpong_id++;
+                }
             }
         }
     }
@@ -966,11 +944,6 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, int total_q_heads, int q_he
         wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
     }
 
-    pipe_barrier(PIPE_ALL);
-    uint64_t tEnd = get_sys_cnt();
-    if (profile_entry != nullptr) {
-        profile_entry[1] = tEnd;
-    }
     }
 }
 
