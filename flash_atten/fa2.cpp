@@ -669,6 +669,10 @@ AICORE inline void runTFABodyRuntime(int s0, int s1, int total_q_heads, int q_he
     uint64_t tStart = get_sys_cnt();
 
     set_ffts_base_addr((uint64_t)ffts_addr);
+    if constexpr (DAV_VEC){
+        set_mask_norm();
+        set_vector_mask(-1, -1);
+    }
 
     // Rename dimensions for clarity: s0 (rows total), Cube_S0 (per-block rows), s1 (cols), HEAD_SIZE (inner)
     constexpr uint32_t Cube_S0 = CUBE_S0;
