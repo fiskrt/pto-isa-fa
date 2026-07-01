@@ -51,13 +51,14 @@ def main():
     kt = k.t().contiguous()  # [HEAD, S1] as the kernel expects
     o = torch.zeros(S0, HEAD, dtype=torch.float32, device=dev)
 
-    torch.npu.synchronize()  # make sure Q/K/V writes are done before the kernel reads them
+    # Launch on torch's own current stream, so it is ordered after the Q/K/V tensor creation.
+    stream = torch.npu.current_stream().npu_stream
     rc = lib.tfa_run(
         ctypes.c_void_p(q.data_ptr()),
         ctypes.c_void_p(kt.data_ptr()),
         ctypes.c_void_p(v.data_ptr()),
         ctypes.c_void_p(o.data_ptr()),
-        ctypes.c_void_p(0),  # null -> launcher uses its own stream and syncs it
+        ctypes.c_void_p(stream),
     )
     torch.npu.synchronize()
     if rc != 0:

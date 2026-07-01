@@ -22,7 +22,7 @@ add_compile_options(-D_FORTIFY_SOURCE=2 -O2 -std=c++17
 add_link_options(-s -Wl,-z,relro -Wl,-z,now)
 
 include_directories(
-    ${PROJECT_SOURCE_DIR}/include          # vendored pto framework headers
+    ${PROJECT_SOURCE_DIR}/../refs/pto-isa/include   # pto framework headers (from refs/)
     ${ASCEND_HOME_PATH}/include
     ${ASCEND_HOME_PATH}/pkg_inc
     ${ASCEND_HOME_PATH}/pkg_inc/runtime
