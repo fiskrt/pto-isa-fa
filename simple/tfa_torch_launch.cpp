@@ -64,14 +64,20 @@ struct Sizes {
 Sizes compute_sizes(int s0, int /*s1*/)
 {
     const size_t block_rows = static_cast<size_t>(s0) / CUBE_S0;
+    // Scratch is per launched core, not per logical row-block: the kernel launches
+    // min(block_rows, kFaMaxCores) cores and each reuses its own FIFO/scratch slot across the
+    // row-blocks assigned to it, so the workspace scales with the core count and no longer grows with
+    // S0 once S0/CUBE_S0 exceeds kFaMaxCores.
+    const size_t n_cores =
+        block_rows < static_cast<size_t>(kFaMaxCores) ? block_rows : static_cast<size_t>(kFaMaxCores);
 
     Sizes sz{};
-    sz.bytes[0] = qk_fifo_stride * block_rows * sizeof(aclFloat16); // p_tile_fifo (half)
-    sz.bytes[1] = p_max_fifo_stride * block_rows * sizeof(float);   // exp_max_ififo (INTERMEDIATE_CHECK only)
-    sz.bytes[2] = qk_fifo_stride * block_rows * sizeof(float);      // qk_tile_fifo
-    sz.bytes[3] = pv_fifo_stride * block_rows * sizeof(float);      // pv_tile_fifo
-    sz.bytes[4] = kFaProfileBytesPerBlock * block_rows;            // profile
-    sz.bytes[5] = block_rows * kFaCvCommSlotBytes;                 // cv_comm
+    sz.bytes[0] = qk_fifo_stride * n_cores * sizeof(aclFloat16); // p_tile_fifo (half)
+    sz.bytes[1] = p_max_fifo_stride * n_cores * sizeof(float);   // exp_max_ififo (INTERMEDIATE_CHECK only)
+    sz.bytes[2] = qk_fifo_stride * n_cores * sizeof(float);      // qk_tile_fifo
+    sz.bytes[3] = pv_fifo_stride * n_cores * sizeof(float);      // pv_tile_fifo
+    sz.bytes[4] = kFaProfileBytesPerBlock * n_cores;            // profile
+    sz.bytes[5] = n_cores * kFaCvCommSlotBytes;                 // cv_comm
     return sz;
 }
 

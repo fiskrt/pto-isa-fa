@@ -575,7 +575,7 @@ AICORE inline void compute_gu(PVPipe &pvPipe, int tile_id, int num_tiles, __gm__
             // softmax normalization. This is needed for the non-causal path too, not only causal —
             // otherwise a single-S1-tile (S1 == TILE_S1) output is left divided-by-nothing.
             if (tile_id == num_tiles - 1) {
-                    pto_macro_fa_gu_single_and_last_tile(runningOTile, l2_global_sum);
+                pto_macro_fa_gu_single_and_last_tile(runningOTile, l2_global_sum);
             }
         } else {
             TLOAD(pvVecTile, pvGlobal);
@@ -614,10 +614,8 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, __gm__ uint64_t *ffts_ad
     uint64_t tStart = get_sys_cnt();
 
     set_ffts_base_addr((uint64_t)ffts_addr);
-    if constexpr (DAV_CUBE) {
-        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
-        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
-    }
+    // NOTE: the cube/vec pipeline entry flags are set per row-block inside the LPT loop below (and
+    // drained at the end of each block), so a single core can process several row-blocks in sequence.
     // Reset the vector mask at kernel entry so a stale mask left by a previous
     // launch cannot corrupt vector addressing on back-to-back launches.
     if constexpr (DAV_VEC) {
@@ -718,14 +716,17 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, __gm__ uint64_t *ffts_ad
                               outOTileNBuffers>(qkVecTile, m1_local_max, input_reduce_tmp, l1_local_sum, m2_global_max,
                                                 l2_global_sum, l1_exp_max_ififo, x_expT, pvVecTile, runningOTile, triu);
 
-    // block offset for logical S0
+    // This core's id in [0, n_cores). The host launches n_cores = min(block_rows, kFaMaxCores) cores;
+    // each loops over the row-blocks the LPT scheduler below assigns to it. comm_slot and every FIFO /
+    // scratch buffer are indexed by this id (not the logical row) and reused across the core's blocks.
 #if defined(__DAV_C220_CUBE__) || defined(__DAV_C220_VEC__) // A5 defined macro, don't need to reassign
     const int block_idx = get_block_idx();
 #endif
-    const int block_offset_rows = block_idx * static_cast<int>(Cube_S0);
+    const uint32_t n_cores =
+        (block_rows < static_cast<uint32_t>(kFaMaxCores)) ? block_rows : static_cast<uint32_t>(kFaMaxCores);
 
-    // block_rows is launch-uniform (same on every core), so this branch never diverges.
-    const bool use_cv_comm = (!INTERMEDIATE_CHECK) && (block_rows >= static_cast<uint32_t>(pto::kCvMaxCores));
+    // n_cores <= kFaMaxCores < kCvMaxCores, so this stays on the direct comm_slot == block_idx path.
+    const bool use_cv_comm = (!INTERMEDIATE_CHECK) && (n_cores >= static_cast<uint32_t>(pto::kCvMaxCores));
     int comm_slot = block_idx;
 
     if (use_cv_comm) {
@@ -749,33 +750,11 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, __gm__ uint64_t *ffts_ad
     const size_t pv_fifo_block_stride =
         static_cast<size_t>(pv_tile_fifo_size) * static_cast<size_t>(Cube_S0) * static_cast<size_t>(HEAD_SIZE);
 
-    __gm__ half *q_block = q + block_offset_rows * HEAD_SIZE;
+    // FIFO / scratch blocks are indexed by comm_slot (this core), fixed across all its row-blocks.
     __gm__ half *p_tile_fifo_block = p_tile_fifo + static_cast<size_t>(comm_slot) * p_fifo_block_stride;
     __gm__ float *exp_max_ififo_block = exp_max_ififo + static_cast<size_t>(comm_slot) * p_max_fifo_block_stride;
-    __gm__ float *global_sum_block = global_sum_out + block_offset_rows;
-    __gm__ float *exp_max_block = exp_max_out + block_offset_rows;
-    __gm__ float *o_out_block = o_out + static_cast<size_t>(block_offset_rows) * static_cast<size_t>(HEAD_SIZE);
-    __gm__ float *o_parts_block = o_parts_out + static_cast<size_t>(block_offset_rows) * static_cast<size_t>(HEAD_SIZE);
     __gm__ float *qk_tile_fifo_block = qk_tile_fifo + static_cast<size_t>(comm_slot) * qk_fifo_block_stride;
     __gm__ float *pv_tile_fifo_block = pv_tile_fifo + static_cast<size_t>(comm_slot) * pv_fifo_block_stride;
-
-    int num_tiles_s1 = S1 / Tile_S1;
-    if constexpr (CAUSAL_MASK)
-        num_tiles_s1 = (1 + ((block_idx * CUBE_S0) / Tile_S1));
-    if constexpr (DAV_CUBE) {
-        set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
-        set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
-        set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
-        set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
-        set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
-        set_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
-    }
-    if constexpr (DAV_VEC) {
-        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
-        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
-    }
 
     int p_gu_src_pingpong_id = 0; // shared ping-pong for softmax vec tiles, pv output tiles, and GU input tiles
     int k_src_pingpong_id = 0;    // separate ping-pong for K tiles
@@ -823,6 +802,83 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, __gm__ uint64_t *ffts_ad
     PVecSlotGlobal pVecSlotGlobal;
     PVSlotGlobal pvSlotGlobal;
 
+    // ---------------------------------------------------------------------------------------------
+    // Load-balanced row-block assignment (persistent kernel).
+    //
+    // The host launches n_cores = min(block_rows, kFaMaxCores) cores; this loop hands each core the
+    // row-blocks it should compute. Under the causal mask the per-block cost grows with the row index
+    // (block b sweeps num_tiles_s1 = 1 + b*CUBE_S0/TILE_S1 key tiles), so the naive block_idx == row
+    // mapping leaves the low cores idle while the high cores run long. We instead schedule with
+    // Longest-Processing-Time-first (LPT): walk the row-blocks heaviest -> lightest and give each to
+    // the currently least-loaded core. This equalizes the summed per-core work (a robust
+    // generalization of pairing a light row with a heavy row that also handles row counts not
+    // divisible by the core count) and degenerates to plain round-robin for the non-causal rectangle,
+    // where every block costs the same. Every core runs the identical deterministic simulation and
+    // executes only the row-blocks that land on its own id. When block_rows <= n_cores each core gets
+    // exactly one row-block (a single row-block is a sequential softmax chain, so one-per-core is
+    // already makespan-optimal); the loop earns its keep once S0/CUBE_S0 exceeds the core count.
+    // ---------------------------------------------------------------------------------------------
+    const uint32_t full_tiles = S1 / Tile_S1;
+    uint32_t core_load[kFaMaxCores];
+    for (uint32_t c = 0; c < n_cores; ++c) {
+        core_load[c] = 0;
+    }
+    for (int logical_block = static_cast<int>(block_rows) - 1; logical_block >= 0; --logical_block) {
+        // Cost == the number of key tiles this row-block actually sweeps (must match the capped
+        // num_tiles_s1 computed below): rows past S1 attend every key, so a far-down causal block is
+        // no more expensive than a non-causal one, and the uncapped diagonal formula would mis-rank it.
+        uint32_t blk_weight = full_tiles;
+        if constexpr (CAUSAL_MASK) {
+            const uint32_t diag_tiles = 1u + (static_cast<uint32_t>(logical_block) * Cube_S0) / Tile_S1;
+            blk_weight = diag_tiles < full_tiles ? diag_tiles : full_tiles;
+        }
+        // Assign this row-block to the currently least-loaded core (LPT step).
+        uint32_t best_core = 0;
+        for (uint32_t c = 1; c < n_cores; ++c) {
+            if (core_load[c] < core_load[best_core]) {
+                best_core = c;
+            }
+        }
+        core_load[best_core] += blk_weight;
+        if (best_core != static_cast<uint32_t>(block_idx)) {
+            continue; // this row-block belongs to another core
+        }
+
+        // --- Per-block setup for the row-block this core just claimed. ---
+        const int block_offset_rows = logical_block * static_cast<int>(Cube_S0);
+        __gm__ half *q_block = q + block_offset_rows * HEAD_SIZE;
+        __gm__ float *global_sum_block = global_sum_out + block_offset_rows;
+        __gm__ float *exp_max_block = exp_max_out + block_offset_rows;
+        __gm__ float *o_out_block = o_out + static_cast<size_t>(block_offset_rows) * static_cast<size_t>(HEAD_SIZE);
+        __gm__ float *o_parts_block =
+            o_parts_out + static_cast<size_t>(block_offset_rows) * static_cast<size_t>(HEAD_SIZE);
+        // Actual key tiles this row-block sweeps == blk_weight from the scheduler above; the cap keeps
+        // an S0 > S1 causal block from walking off the end of K/V (its rows attend every key).
+        const int num_tiles_s1 = static_cast<int>(blk_weight);
+
+        // Fresh pipeline state for this row-block (all buffers are drained at the end of the block).
+        k_src_pingpong_id = 0;
+        p_gu_src_pingpong_id = 0;
+        pv_src_pingpong_id = 0;
+
+        // Per-block entry flags, bracketed by the matching drain at the end of the loop body.
+        if constexpr (DAV_CUBE) {
+            set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+            set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+            set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+            set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+            set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+            set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
+            set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+            set_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
+        }
+        if constexpr (DAV_VEC) {
+            set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+            set_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
+            set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+            set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+        }
+
     // QK and P pre-computation (tile_id based)
     for (int preload_tile = 0; preload_tile < static_cast<int>(qkPreloadNum) && preload_tile < num_tiles_s1;
          ++preload_tile) {
@@ -833,7 +889,7 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, __gm__ uint64_t *ffts_ad
                            INTERMEDIATE_CHECK, CAUSAL_MASK>(
                     qkPipe, preload_tile, sub_tile, q_block, k, qk_tile_fifo_block, qMatTile[0],
                     kMatTile[k_src_pingpong_id % kMatTNBuffers], qkAccTile, qkSlotGlobal,
-                    k_src_pingpong_id % kMatTNBuffers, qkAccTileEvtID, block_idx);
+                    k_src_pingpong_id % kMatTNBuffers, qkAccTileEvtID, logical_block);
                 k_src_pingpong_id++;
             }
         }
@@ -846,7 +902,7 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, __gm__ uint64_t *ffts_ad
                     global_sum_block, exp_max_block, qkVecTile[p_gu_src_pingpong_id % srcVecTNBuffers],
                     x_expT[p_gu_src_pingpong_id % xexpVecTNBuffers], input_reduce_tmp, m1_local_max, l1_local_sum,
                     m2_global_max, l2_global_sum, l1_exp_max_ififo[preload_tile % qkp_tile_fifo_size], triu,
-                    qkVecSlotGlobal, pVecSlotGlobal, p_gu_src_pingpong_id % xexpVecTNBuffers, block_idx);
+                    qkVecSlotGlobal, pVecSlotGlobal, p_gu_src_pingpong_id % xexpVecTNBuffers, logical_block);
                 p_gu_src_pingpong_id++;
             }
         }
@@ -868,7 +924,7 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, __gm__ uint64_t *ffts_ad
                                INTERMEDIATE_CHECK, CAUSAL_MASK>(
                         qkPipe, next_qk_tile, sub_tile, q_block, k, qk_tile_fifo_block, qMatTile[0],
                         kMatTile[k_src_pingpong_id % kMatTNBuffers], qkAccTile, qkSlotGlobal,
-                        k_src_pingpong_id % kMatTNBuffers, qkAccTileEvtID, block_idx);
+                        k_src_pingpong_id % kMatTNBuffers, qkAccTileEvtID, logical_block);
                     k_src_pingpong_id++;
                 }
             }
@@ -882,7 +938,7 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, __gm__ uint64_t *ffts_ad
                         qkVecTile[p_gu_src_pingpong_id % srcVecTNBuffers],
                         x_expT[p_gu_src_pingpong_id % xexpVecTNBuffers], input_reduce_tmp, m1_local_max, l1_local_sum,
                         m2_global_max, l2_global_sum, l1_exp_max_ififo[next_qk_tile % qkp_tile_fifo_size], triu,
-                        qkVecSlotGlobal, pVecSlotGlobal, p_gu_src_pingpong_id % xexpVecTNBuffers, block_idx);
+                        qkVecSlotGlobal, pVecSlotGlobal, p_gu_src_pingpong_id % xexpVecTNBuffers, logical_block);
                     p_gu_src_pingpong_id++;
                 }
             }
@@ -893,7 +949,7 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, __gm__ uint64_t *ffts_ad
                     pPipe, pvPipe, tile_id, sub_tile, v, p_tile_fifo_block,
                     pMatTile[pv_src_pingpong_id % pMatTNBuffers], vMatTile[pv_src_pingpong_id % vMatTNBuffers],
                     pvAccTile, pSlotGlobal, pvSlotGlobal, pv_src_pingpong_id % vMatTNBuffers + PV_EVENT_ID0,
-                    pvAccTileEvtID, block_idx);
+                    pvAccTileEvtID, logical_block);
                 pv_src_pingpong_id++;
             }
         }
@@ -906,25 +962,29 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, __gm__ uint64_t *ffts_ad
                 l2_global_sum, p_gu_src_pingpong_id % outOTileNBuffers);
             p_gu_src_pingpong_id++;
         }
-    }
+    } // end steady-state tile loop for this row-block
 
-    if constexpr (DAV_CUBE) {
-        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
-        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
-        wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
-        wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
-        wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
-        wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
-        wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
-        wait_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
-    }
-
-    if constexpr (DAV_VEC) {
-        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
-        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
-    }
+        // ---- Per-block drain, bracketed against the per-block entry flags above. ----
+        // Return every bracketing flag to its initial state and quiesce the pipeline so the next
+        // row-block can safely reuse the single-buffered Q / reduce / running-O tiles.
+        if constexpr (DAV_CUBE) {
+            wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+            wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+            wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+            wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+            wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+            wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
+            wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+            wait_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
+        }
+        if constexpr (DAV_VEC) {
+            wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+            wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
+            wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+            wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+        }
+        pipe_barrier(PIPE_ALL);
+    } // end per-core row-block loop
 
     pipe_barrier(PIPE_ALL);
     uint64_t tEnd = get_sys_cnt();
@@ -957,29 +1017,33 @@ void LaunchTFA(uint32_t S0, uint32_t S1, uint16_t *ffts, aclFloat16 *q, aclFloat
 {
     // S0/S1 are runtime now; caller must ensure S0 % CUBE_S0 == 0 and S1 % TILE_S1 == 0.
     const uint32_t block_rows = S0 / CUBE_S0;
+    // Persistent kernel: never launch more than kFaMaxCores cores. Each launched core loops over the
+    // row-blocks assigned to it (LPT-balanced for the causal mask) — see runTFA.
+    const uint32_t n_cores =
+        block_rows < static_cast<uint32_t>(kFaMaxCores) ? block_rows : static_cast<uint32_t>(kFaMaxCores);
 
 // #if defined(__DAV_C220_CUBE__) || defined(__DAV_C220_VEC__)
 //     // Warm up all cores first, then prefetch q/k/v into L2
 //     warmup_kernel<<<24, nullptr, stream>>>();
 
-//     const uint64_t tensor_elems = static_cast<uint64_t>(S0) * static_cast<uint64_t>(HEAD_SIZE);
-//     const uint64_t tensor_bytes = tensor_elems * sizeof(half);
-//     constexpr bool kPrefetchUseSdma = true; // simulation cannot use sdma
-//     constexpr int kPrefetchAivCores = 40;   // only used when kPrefetchUseSdma is false
+    // const uint64_t tensor_elems = static_cast<uint64_t>(S0) * static_cast<uint64_t>(HEAD_SIZE);
+    // const uint64_t tensor_bytes = tensor_elems * sizeof(half);
+    // constexpr bool kPrefetchUseSdma = true; // simulation cannot use sdma
+    // constexpr int kPrefetchAivCores = 40;   // only used when kPrefetchUseSdma is false
 
-//     if constexpr (kPrefetchUseSdma) {
-//         PTO_PREFETCH((__gm__ void *)q, tensor_bytes, stream);
-//         PTO_PREFETCH((__gm__ void *)k, tensor_bytes, stream);
-//         PTO_PREFETCH((__gm__ void *)v, tensor_bytes, stream);
-//     } else {
-//         PTO_PREFETCH<false, kPrefetchAivCores>((__gm__ void *)q, tensor_bytes, stream);
-//         PTO_PREFETCH<false, kPrefetchAivCores>((__gm__ void *)k, tensor_bytes, stream);
-//         PTO_PREFETCH<false, kPrefetchAivCores>((__gm__ void *)v, tensor_bytes, stream);
-//     }
+    // if constexpr (kPrefetchUseSdma) {
+    //     PTO_PREFETCH((__gm__ void *)q, tensor_bytes, stream);
+    //     PTO_PREFETCH((__gm__ void *)k, tensor_bytes, stream);
+    //     PTO_PREFETCH((__gm__ void *)v, tensor_bytes, stream);
+    // } else {
+    //     PTO_PREFETCH<false, kPrefetchAivCores>((__gm__ void *)q, tensor_bytes, stream);
+    //     PTO_PREFETCH<false, kPrefetchAivCores>((__gm__ void *)k, tensor_bytes, stream);
+    //     PTO_PREFETCH<false, kPrefetchAivCores>((__gm__ void *)v, tensor_bytes, stream);
+    // }
 // #endif
 
     runTFA<HEAD_SIZE, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, CV_FIFO_SIZE, INTERMEDIATE_CHECK, CAUSAL_MASK,
-           CV_FIFO_CONS_SYNC_PERIOD><<<block_rows, nullptr, stream>>>(
+           CV_FIFO_CONS_SYNC_PERIOD><<<n_cores, nullptr, stream>>>(
         S0, S1, (__gm__ uint64_t *)ffts, (half *)q, (half *)k, (half *)v, (half *)p_tile_fifo, exp_max_ififo,
         global_sum_out, exp_max_out, o_out, o_parts_out, qk_tile_fifo, pv_tile_fifo, cv_comm_buf, profile_data);
 }

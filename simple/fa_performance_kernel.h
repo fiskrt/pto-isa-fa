@@ -25,6 +25,11 @@ constexpr std::size_t kFaProfileBytesPerBlock = 1024 * 3; // cube + two vec subb
 constexpr std::size_t kFaCvCommSlotBytes = 512U;
 constexpr int VEC_CORES = 2; // Default to 2 vector cores per cube
 
+// Persistent-kernel core cap. The host launches min(S0/CUBE_S0, kFaMaxCores) cores and each core loops
+// over the row-blocks assigned to it (LPT-balanced for the causal mask). Must stay < pto::kCvMaxCores
+// (25) so the kernel keeps the direct comm_slot == get_block_idx() path. 24 = physical AI-core count.
+constexpr int kFaMaxCores = 24;
+
 // S0 (rows) and S1 (cols) are runtime arguments so a single instantiation serves arbitrary
 // shapes; only the tiling below (HEAD_SIZE/CUBE_S0/CUBE_S1/TILE_S1/...) is fixed at compile time.
 template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1 = kFaCubeS1, int TILE_S1 = kFaTileS1,
