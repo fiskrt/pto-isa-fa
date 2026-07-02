@@ -97,6 +97,8 @@ def main():
     # --- Benchmark ---
     t_us = do_bench(run, warmup_iters=10, benchmark_iters=50, unit="us")
     flops = 4.0 * S0 * S1 * HEAD  # QK: 2*S0*S1*HEAD, PV: 2*S0*S1*HEAD
+    if causal:
+        flops *= 0.5  # only the lower triangle is computed (standard causal convention)
     tflops = flops / (t_us * 1e-6) / 1e12
     print(f"[poc] latency = {t_us:.3f} us  (~{tflops:.2f} TFLOP/s, {flops/1e6:.1f} MFLOP)")
 
