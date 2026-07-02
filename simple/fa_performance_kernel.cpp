@@ -571,8 +571,10 @@ AICORE inline void compute_gu(PVPipe &pvPipe, int tile_id, int num_tiles, __gm__
             TLOAD(runningOTile, pvGlobal);
             set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            if constexpr (CAUSAL_MASK) {
-                if (tile_id == num_tiles - 1)
+            // Single-tile case (num_tiles == 1): tile 0 is also the last tile and must run the final
+            // softmax normalization. This is needed for the non-causal path too, not only causal —
+            // otherwise a single-S1-tile (S1 == TILE_S1) output is left divided-by-nothing.
+            if (tile_id == num_tiles - 1) {
                     pto_macro_fa_gu_single_and_last_tile(runningOTile, l2_global_sum);
             }
         } else {
