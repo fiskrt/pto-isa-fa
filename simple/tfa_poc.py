@@ -2,15 +2,18 @@
 """PoC + benchmark: drive the manual Flash-Attention kernel from torch_npu tensors.
 
 Creates Q/K/V as torch tensors directly on the NPU, allocates the kernel workspace,
-and hands device pointers to the C-ABI launcher (libtfa_torch.so -> tfa_run). First
-checks correctness against a plain torch reference attention, then times the kernel
+and hands device pointers to the C-ABI launcher (libtfa_torch.so via tfa_kernel.TfaKernel).
+First checks correctness against a plain torch reference attention, then times the kernel
 with utils/bench.py:do_bench. Nothing on disk is needed (no .bin golden files).
+
+S0/S1 are runtime kernel args now, so any shape with S0 a multiple of the reported s0_multiple
+and S1 a multiple of s1_multiple works against a single build; override with --s0/--s1.
 
 Run:
     source /usr/local/Ascend/ascend-toolkit/set_env.sh
-    /home/fskogh/famy/.fa_env/bin/python3 tfa_poc.py
+    /home/fskogh/famy/.fa_env/bin/python3 tfa_poc.py [--s0 128] [--s1 1024]
 """
-import ctypes
+import argparse
 import math
 import os
 import sys
@@ -19,32 +22,27 @@ import torch
 import torch_npu  # noqa: F401  (registers the 'npu' backend)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from tfa_kernel import TfaKernel
 from utils.bench import do_bench
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-LIB = os.path.join(HERE, "build", "lib", "libtfa_torch.so")
 
 ATOL = 1e-3  # same bar the kernel's own golden test uses (ResultCmp in main.cpp)
 
 
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--s0", type=int, default=128, help="query rows (multiple of s0_multiple)")
+    p.add_argument("--s1", type=int, default=1024, help="key/value rows (multiple of s1_multiple)")
+    return p.parse_args()
+
+
 def main():
-    if not os.path.exists(LIB):
-        sys.exit(f"missing {LIB}; build first: bash build.sh")
+    args = parse_args()
 
-    lib = ctypes.CDLL(LIB)
-    lib.tfa_run.restype = ctypes.c_int
-    lib.tfa_run.argtypes = [ctypes.c_void_p] * 6
-    lib.tfa_shape.restype = None
-    lib.tfa_shape.argtypes = [ctypes.POINTER(ctypes.c_int)] * 3
-    lib.tfa_workspace_size.restype = ctypes.c_size_t
-    lib.tfa_workspace_size.argtypes = []
-
-    s0 = ctypes.c_int(0)
-    head = ctypes.c_int(0)
-    s1 = ctypes.c_int(0)
-    lib.tfa_shape(ctypes.byref(s0), ctypes.byref(head), ctypes.byref(s1))
-    S0, HEAD, S1 = s0.value, head.value, s1.value
-    print(f"[poc] kernel shape: S0={S0} HEAD={HEAD} S1={S1}")
+    kernel = TfaKernel()
+    HEAD, s0_mult, s1_mult = kernel.config
+    S0, S1 = args.s0, args.s1
+    kernel.validate_shape(S0, S1)
+    print(f"[poc] kernel shape: S0={S0} HEAD={HEAD} S1={S1}  (multiples: S0%{s0_mult}, S1%{s1_mult})")
 
     torch.npu.set_device(0)
     dev = "npu:0"
@@ -60,22 +58,17 @@ def main():
 
     # Kernel scratch: allocate one workspace block here and hand it to the kernel.
     # Kept alive for every launch below (the torch-stream path is async).
-    ws_bytes = lib.tfa_workspace_size()
+    ws_bytes = kernel.workspace_size(S0, S1)
     workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=dev)
-    print(f"[poc] workspace = {ws_bytes} bytes")
-
-    q_ptr = ctypes.c_void_p(q.data_ptr())
-    kt_ptr = ctypes.c_void_p(kt.data_ptr())
-    v_ptr = ctypes.c_void_p(v.data_ptr())
-    o_ptr = ctypes.c_void_p(o.data_ptr())
-    ws_ptr = ctypes.c_void_p(workspace.data_ptr())
+    print(f"[poc] workspace = {ws_bytes // 2 ** 20} MiB")
 
     def run():
         # Launch on torch's own current stream, so it is ordered after the tensor
-        # creation and timed correctly by do_bench's events. tfa_run only enqueues
+        # creation and timed correctly by do_bench's events. run() only enqueues
         # here (no internal sync) — the caller owns synchronization.
         stream = torch.npu.current_stream().npu_stream
-        return lib.tfa_run(q_ptr, kt_ptr, v_ptr, o_ptr, ws_ptr, ctypes.c_void_p(stream))
+        return kernel.run(q.data_ptr(), kt.data_ptr(), v.data_ptr(), o.data_ptr(),
+                          workspace.data_ptr(), stream, S0, S1)
 
     # --- Correctness vs a torch reference: softmax(Q Kt * scale) @ V, all in fp32 ---
     run()

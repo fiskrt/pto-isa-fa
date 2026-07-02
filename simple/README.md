@@ -7,24 +7,28 @@ No golden `.bin` files, no case sweep, no cost model — just the kernel and a t
 - `fa_performance_kernel.cpp/.h` — the FA kernel + `LaunchTFA` host launcher (device code).
 - `pto_macro_*.hpp` — kernel sub-stage macros (matmul / softmax / gu).
 - `include/` — vendored `pto/` framework headers (so this folder needs nothing from pto-isa).
-- `tfa_torch_launch.cpp` — C-ABI `tfa_run(q,k,v,o,workspace,stream)` + `tfa_workspace_size()`;
-  slices the kernel's scratch out of a caller-provided workspace, calls `LaunchTFA<...>`.
-- `tfa_poc.py` — creates Q/K/V/O + workspace as NPU tensors, launches via `ctypes`, checks vs a
+- `tfa_torch_launch.cpp` — C-ABI `tfa_run(q,k,v,o,workspace,stream,s0,s1)` + `tfa_workspace_size(s0,s1)`
+  + `tfa_config(head,s0_mult,s1_mult)`; slices the kernel's scratch out of a caller-provided
+  workspace, calls `LaunchTFA<...>`.
+- `tfa_kernel.py` — `TfaKernel`, a thin `ctypes` wrapper over `libtfa_torch.so` (all FFI lives here).
+- `tfa_poc.py` — creates Q/K/V/O + workspace as NPU tensors, launches via `TfaKernel`, checks vs a
   torch reference, then benchmarks the kernel with `utils/bench.py:do_bench`.
 - `utils/bench.py` — `do_bench` timing helper (warmup, L2 flush, torch-event timing).
 - `CMakeLists.txt`, `build.sh`.
 
 ## Shape
-Fixed at `S0=128, HEAD=128, S1=1024` in two places that must agree:
-the `INSTANTIATE_TFA(...)` line in `fa_performance_kernel.cpp` and the `LaunchTFA<...>` call in
-`tfa_torch_launch.cpp`. (The template is defined in the `.cpp`, so the shape must be explicitly
-instantiated into the `.so` for the host wrapper to link.)
+`S0` (rows) and `S1` (cols) are **runtime** kernel args, so one build serves any shape with
+`S0 % CUBE_S0 == 0` and `S1 % TILE_S1 == 0` (query the multiples via `tfa_config`). Only the tiling
+(`HEAD=128, CUBE_S0=128, CUBE_S1=128, TILE_S1=256, QK_PRELOAD=4`) is fixed at compile time, and must
+agree between the `INSTANTIATE_TFA(...)` line in `fa_performance_kernel.cpp` and the `LaunchTFA<...>`
+call in `tfa_torch_launch.cpp`. Pick a shape at runtime with `tfa_poc.py --s0 <rows> --s1 <cols>`.
 
 ## Build & run
 ```bash
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 bash build.sh
-/home/fskogh/famy/.fa_env/bin/python3 tfa_poc.py
+/home/fskogh/famy/.fa_env/bin/python3 tfa_poc.py            # default S0=128 S1=1024
+/home/fskogh/famy/.fa_env/bin/python3 tfa_poc.py --s0 256 --s1 2048
 ```
 Expect `[poc] PASS` (max abs diff ~2e-4 vs torch reference, atol 1e-3) followed by a
 `[poc] latency = ... us` line from the benchmark.
