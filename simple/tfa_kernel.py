@@ -27,7 +27,7 @@ class TfaKernel:
         lib.tfa_workspace_size.restype = ctypes.c_size_t
         lib.tfa_workspace_size.argtypes = [ctypes.c_int, ctypes.c_int]
         lib.tfa_run.restype = ctypes.c_int
-        lib.tfa_run.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int, ctypes.c_int]
+        lib.tfa_run.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int, ctypes.c_int, ctypes.c_int]
 
     @property
     def config(self):
@@ -48,9 +48,10 @@ class TfaKernel:
         """Bytes to allocate for the workspace block for this shape."""
         return int(self._lib.tfa_workspace_size(s0, s1))
 
-    def run(self, q_ptr, k_ptr, v_ptr, o_ptr, ws_ptr, stream, s0, s1):
+    def run(self, q_ptr, k_ptr, v_ptr, o_ptr, ws_ptr, stream, s0, s1, causal=False):
         """Enqueue the kernel on `stream`. Pointers are raw device addresses (ints from data_ptr()).
 
-        Returns the launcher's rc (0 on enqueue when a caller stream is given).
+        `causal` selects the lower-triangular masked variant. Returns the launcher's rc
+        (0 on enqueue when a caller stream is given).
         """
-        return self._lib.tfa_run(q_ptr, k_ptr, v_ptr, o_ptr, ws_ptr, stream, s0, s1)
+        return self._lib.tfa_run(q_ptr, k_ptr, v_ptr, o_ptr, ws_ptr, stream, s0, s1, int(causal))

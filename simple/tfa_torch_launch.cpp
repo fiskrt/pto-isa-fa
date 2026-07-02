@@ -18,6 +18,7 @@
 #include <acl/acl.h>
 #include <cstdint>
 #include <cstdio>
+#include <type_traits>
 
 #include "runtime/rt.h"
 #include "fa_performance_kernel.h"
@@ -45,45 +46,45 @@ constexpr size_t align_up(size_t x)
     return (x + kWsAlign - 1) & ~(kWsAlign - 1);
 }
 
-// The nine scratch buffers, in the order they are carved out of the single caller-provided
-// workspace block. Sizes scale with block_rows = S0/CUBE_S0 and num_tiles = S1/TILE_S1, so they
-// are computed at runtime from (s0, s1). Keep this in sync with Scratch's member order.
+// The live scratch buffers, in the order they are carved out of the single caller-provided
+// workspace block. Every one of these is a fixed-depth (kFaCvFifoSize) per-block ring buffer or a
+// per-block scalar area, so the workspace scales only with block_rows = S0/CUBE_S0 and is
+// independent of S1 — that is the point of the flash-attention streaming FIFOs.
+//
+// The kernel's `global_sum_out`, `exp_max_out` and `o_parts_out` outputs are NOT allocated here:
+// they are legacy per-tile golden-dump buffers (used by main.cpp's ResultCmp, which this standalone
+// build has no equivalent of). runTFA never writes them, so tfa_run passes nullptr. They were the
+// only S1-dependent (O(S0*S1)) allocations — o_parts alone was 128 MiB at 8192x8192 — and dropping
+// them makes the workspace ~2x smaller and no longer grow with S1.
 struct Sizes {
-    size_t bytes[9];
-    static constexpr size_t kCount = 9;
+    size_t bytes[6];
+    static constexpr size_t kCount = 6;
 };
 
-Sizes compute_sizes(int s0, int s1)
+Sizes compute_sizes(int s0, int /*s1*/)
 {
     const size_t block_rows = static_cast<size_t>(s0) / CUBE_S0;
-    const size_t num_tiles = static_cast<size_t>(s1) / TILE_S1;
 
     Sizes sz{};
-    sz.bytes[0] = qk_fifo_stride * block_rows * sizeof(aclFloat16);              // p_tile_fifo (half)
-    sz.bytes[1] = p_max_fifo_stride * block_rows * sizeof(float);               // exp_max_ififo
-    sz.bytes[2] = static_cast<size_t>(s0) * num_tiles * sizeof(float);          // global_sum
-    sz.bytes[3] = static_cast<size_t>(s0) * num_tiles * sizeof(float);          // exp_max
-    sz.bytes[4] = static_cast<size_t>(s0) * HEAD_SIZE * sizeof(float) * num_tiles; // o_parts
-    sz.bytes[5] = qk_fifo_stride * block_rows * sizeof(float);                  // qk_tile_fifo
-    sz.bytes[6] = pv_fifo_stride * block_rows * sizeof(float);                  // pv_tile_fifo
-    sz.bytes[7] = kFaProfileBytesPerBlock * block_rows;                         // profile
-    sz.bytes[8] = block_rows * kFaCvCommSlotBytes;                             // cv_comm
+    sz.bytes[0] = qk_fifo_stride * block_rows * sizeof(aclFloat16); // p_tile_fifo (half)
+    sz.bytes[1] = p_max_fifo_stride * block_rows * sizeof(float);   // exp_max_ififo (INTERMEDIATE_CHECK only)
+    sz.bytes[2] = qk_fifo_stride * block_rows * sizeof(float);      // qk_tile_fifo
+    sz.bytes[3] = pv_fifo_stride * block_rows * sizeof(float);      // pv_tile_fifo
+    sz.bytes[4] = kFaProfileBytesPerBlock * block_rows;            // profile
+    sz.bytes[5] = block_rows * kFaCvCommSlotBytes;                 // cv_comm
     return sz;
 }
 
 struct Scratch {
     void *p_tile_fifo = nullptr;   // half
     void *exp_max_ififo = nullptr; // float
-    void *global_sum = nullptr;    // float
-    void *exp_max = nullptr;       // float
-    void *o_parts = nullptr;       // float
     void *qk_tile_fifo = nullptr;  // float
     void *pv_tile_fifo = nullptr;  // float
     void *profile = nullptr;       // uint8
     void *cv_comm = nullptr;       // uint8
 };
 
-// Total bytes the workspace must hold for (s0, s1), assuming a 512-byte-aligned base.
+// Total bytes the workspace must hold for this shape, assuming a 512-byte-aligned base.
 size_t workspace_bytes(int s0, int s1)
 {
     const Sizes sz = compute_sizes(s0, s1);
@@ -95,14 +96,13 @@ size_t workspace_bytes(int s0, int s1)
     return off;
 }
 
-// Slice the nine sub-buffers out of `base` at the same offsets workspace_bytes() accounts for.
-// `base` must be 512-byte aligned (torch NPU allocations are).
+// Slice the sub-buffers out of `base` at the same offsets workspace_bytes() accounts for.
+// `base` must be 512-byte aligned (torch NPU allocations are). Keep this in sync with Scratch.
 void carve_workspace(void *base, int s0, int s1, Scratch &out)
 {
     const Sizes sz = compute_sizes(s0, s1);
     void **dst[Sizes::kCount] = {
-        &out.p_tile_fifo, &out.exp_max_ififo, &out.global_sum,  &out.exp_max, &out.o_parts,
-        &out.qk_tile_fifo, &out.pv_tile_fifo, &out.profile,     &out.cv_comm,
+        &out.p_tile_fifo, &out.exp_max_ififo, &out.qk_tile_fifo, &out.pv_tile_fifo, &out.profile, &out.cv_comm,
     };
     uintptr_t b = reinterpret_cast<uintptr_t>(base);
     size_t off = 0;
@@ -148,7 +148,7 @@ size_t tfa_workspace_size(int s0, int s1)
 // current stream), the kernel is only *enqueued* — the caller owns ordering/synchronization/timing —
 // so tfa_run returns 0 without blocking. This keeps the launch async, which is required for correct
 // benchmarking via torch events (do_bench).
-int tfa_run(void *q, void *k, void *v, void *o, void *workspace, void *stream_handle, int s0, int s1)
+int tfa_run(void *q, void *k, void *v, void *o, void *workspace, void *stream_handle, int s0, int s1, int causal)
 {
     if (workspace == nullptr) {
         fprintf(stderr, "[tfa] workspace pointer is null\n");
@@ -175,15 +175,25 @@ int tfa_run(void *q, void *k, void *v, void *o, void *workspace, void *stream_ha
         own_stream = true;
     }
 
-    LaunchTFA<HEAD_SIZE, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, kFaCvFifoSize, false, false,
-              kFaCvFifoConsSyncPeriod>(
-        static_cast<uint32_t>(s0), static_cast<uint32_t>(s1), reinterpret_cast<uint16_t *>(ffts),
-        reinterpret_cast<aclFloat16 *>(q), reinterpret_cast<aclFloat16 *>(k), reinterpret_cast<aclFloat16 *>(v),
-        reinterpret_cast<aclFloat16 *>(scratch.p_tile_fifo), reinterpret_cast<float *>(scratch.exp_max_ififo),
-        reinterpret_cast<float *>(scratch.global_sum), reinterpret_cast<float *>(scratch.exp_max),
-        reinterpret_cast<float *>(o), reinterpret_cast<float *>(scratch.o_parts),
-        reinterpret_cast<float *>(scratch.qk_tile_fifo), reinterpret_cast<float *>(scratch.pv_tile_fifo),
-        reinterpret_cast<uint8_t *>(scratch.profile), stream, reinterpret_cast<uint8_t *>(scratch.cv_comm));
+    // CAUSAL_MASK is a compile-time template arg, but both variants are instantiated (see
+    // INSTANTIATE_TFA), so pick the matching one at runtime from the `causal` flag.
+    auto launch = [&](auto causal_tag) {
+        constexpr bool CAUSAL = decltype(causal_tag)::value;
+        LaunchTFA<HEAD_SIZE, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, kFaCvFifoSize, false, CAUSAL,
+                  kFaCvFifoConsSyncPeriod>(
+            static_cast<uint32_t>(s0), static_cast<uint32_t>(s1), reinterpret_cast<uint16_t *>(ffts),
+            reinterpret_cast<aclFloat16 *>(q), reinterpret_cast<aclFloat16 *>(k), reinterpret_cast<aclFloat16 *>(v),
+            reinterpret_cast<aclFloat16 *>(scratch.p_tile_fifo), reinterpret_cast<float *>(scratch.exp_max_ififo),
+            /*global_sum_out=*/nullptr, /*exp_max_out=*/nullptr, reinterpret_cast<float *>(o),
+            /*o_parts_out=*/nullptr, reinterpret_cast<float *>(scratch.qk_tile_fifo),
+            reinterpret_cast<float *>(scratch.pv_tile_fifo), reinterpret_cast<uint8_t *>(scratch.profile), stream,
+            reinterpret_cast<uint8_t *>(scratch.cv_comm));
+    };
+    if (causal) {
+        launch(std::true_type{});
+    } else {
+        launch(std::false_type{});
+    }
 
     if (own_stream) {
         // We created this stream, so we must sync before destroying it; the sync

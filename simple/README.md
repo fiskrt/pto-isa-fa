@@ -29,7 +29,13 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 bash build.sh
 /home/fskogh/famy/.fa_env/bin/python3 tfa_poc.py            # default S0=128 S1=1024
 /home/fskogh/famy/.fa_env/bin/python3 tfa_poc.py --s0 256 --s1 2048
+/home/fskogh/famy/.fa_env/bin/python3 tfa_poc.py --s0 2048 --s1 2048 --causal
 ```
+`--causal` applies a lower-triangular mask (query row `i` attends to key `j <= i`). Both mask
+variants are compiled in (`INSTANTIATE_TFA(... , false/true)`); `tfa_run` picks one at runtime.
+Causal uses a looser bar (`6e-3` vs `1e-3`): the kernel keeps the softmax `P` and `V` in fp16, so
+each row carries ~per-key fp16 error that averages out over many keys but not over causal's
+near-diagonal rows (row 0 is exact, row `i` sums only `i+1` keys), where the residual peaks ~4e-3.
 Expect `[poc] PASS` (max abs diff ~2e-4 vs torch reference, atol 1e-3) followed by a
 `[poc] latency = ... us` line from the benchmark.
 

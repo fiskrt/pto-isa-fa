@@ -1024,7 +1024,9 @@ void LaunchTFA(uint32_t S0, uint32_t S1, uint16_t *ffts, aclFloat16 *q, aclFloat
 
 // Single compile-time tiling for the torch PoC: must match LaunchTFA<...> in tfa_torch_launch.cpp.
 // (HEAD, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, CAUSAL_MASK)  — S0/S1 are chosen at runtime.
+// Both CAUSAL_MASK variants are instantiated so tfa_run can pick one at runtime.
 INSTANTIATE_TFA(128, 128, 128, 256, 4, false)
+INSTANTIATE_TFA(128, 128, 128, 256, 4, true)
 
 #undef INSTANTIATE_TFA
 #endif // __COSTMODEL
