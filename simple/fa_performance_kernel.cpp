@@ -616,6 +616,12 @@ __global__ AICORE void runTFA(__gm__ uint64_t *ffts_addr, __gm__ half *q, __gm__
         set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
         set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
     }
+    // Reset the vector mask at kernel entry so a stale mask left by a previous
+    // launch cannot corrupt vector addressing on back-to-back launches.
+    if constexpr (DAV_VEC) {
+        set_mask_norm();
+        set_vector_mask(-1, -1);
+    }
 
     // Rename dimensions for clarity: S0 (rows total), Cube_S0 (per-block rows), S1 (cols), HEAD_SIZE (inner)
     constexpr uint32_t Cube_S0 = CUBE_S0;
@@ -933,9 +939,9 @@ __global__ AICORE void runTFA(__gm__ uint64_t *ffts_addr, __gm__ half *q, __gm__
 #endif
 }
 
-// Empty kernel to warm up cores
-__global__ AICORE __attribute__((aic)) void warmup_kernel()
-{}
+// // Empty kernel to warm up cores
+// __global__ AICORE __attribute__((aic)) void warmup_kernel()
+// {}
 
 // Host wrapper (NPU launch — skipped under costmodel)
 #ifndef __COSTMODEL
@@ -949,25 +955,25 @@ void LaunchTFA(uint16_t *ffts, aclFloat16 *q, aclFloat16 *k, aclFloat16 *v, aclF
     static_assert(S0 % CUBE_S0 == 0, "S0 must be divisible by CUBE_S0");
     constexpr uint32_t block_rows = S0 / CUBE_S0;
 
-#if defined(__DAV_C220_CUBE__) || defined(__DAV_C220_VEC__)
-    // Warm up all cores first, then prefetch q/k/v into L2
-    warmup_kernel<<<24, nullptr, stream>>>();
+// #if defined(__DAV_C220_CUBE__) || defined(__DAV_C220_VEC__)
+//     // Warm up all cores first, then prefetch q/k/v into L2
+//     warmup_kernel<<<24, nullptr, stream>>>();
 
-    const uint64_t tensor_elems = static_cast<uint64_t>(S0) * static_cast<uint64_t>(HEAD_SIZE);
-    const uint64_t tensor_bytes = tensor_elems * sizeof(half);
-    constexpr bool kPrefetchUseSdma = true; // simulation cannot use sdma
-    constexpr int kPrefetchAivCores = 40;   // only used when kPrefetchUseSdma is false
+//     const uint64_t tensor_elems = static_cast<uint64_t>(S0) * static_cast<uint64_t>(HEAD_SIZE);
+//     const uint64_t tensor_bytes = tensor_elems * sizeof(half);
+//     constexpr bool kPrefetchUseSdma = true; // simulation cannot use sdma
+//     constexpr int kPrefetchAivCores = 40;   // only used when kPrefetchUseSdma is false
 
-    if constexpr (kPrefetchUseSdma) {
-        PTO_PREFETCH((__gm__ void *)q, tensor_bytes, stream);
-        PTO_PREFETCH((__gm__ void *)k, tensor_bytes, stream);
-        PTO_PREFETCH((__gm__ void *)v, tensor_bytes, stream);
-    } else {
-        PTO_PREFETCH<false, kPrefetchAivCores>((__gm__ void *)q, tensor_bytes, stream);
-        PTO_PREFETCH<false, kPrefetchAivCores>((__gm__ void *)k, tensor_bytes, stream);
-        PTO_PREFETCH<false, kPrefetchAivCores>((__gm__ void *)v, tensor_bytes, stream);
-    }
-#endif
+//     if constexpr (kPrefetchUseSdma) {
+//         PTO_PREFETCH((__gm__ void *)q, tensor_bytes, stream);
+//         PTO_PREFETCH((__gm__ void *)k, tensor_bytes, stream);
+//         PTO_PREFETCH((__gm__ void *)v, tensor_bytes, stream);
+//     } else {
+//         PTO_PREFETCH<false, kPrefetchAivCores>((__gm__ void *)q, tensor_bytes, stream);
+//         PTO_PREFETCH<false, kPrefetchAivCores>((__gm__ void *)k, tensor_bytes, stream);
+//         PTO_PREFETCH<false, kPrefetchAivCores>((__gm__ void *)v, tensor_bytes, stream);
+//     }
+// #endif
 
     runTFA<S0, HEAD_SIZE, S1, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, CV_FIFO_SIZE, INTERMEDIATE_CHECK, CAUSAL_MASK,
            CV_FIFO_CONS_SYNC_PERIOD><<<block_rows, nullptr, stream>>>(

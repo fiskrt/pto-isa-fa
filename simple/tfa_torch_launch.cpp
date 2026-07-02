@@ -104,8 +104,11 @@ void tfa_shape(int *s0, int *head, int *s1)
 }
 
 // Launch the FA kernel on device pointers taken from torch tensors.
-// If stream_handle is null, a temporary stream is created/synced/destroyed internally.
-// Returns 0 on success, negative on setup failure, or the aclrtSynchronizeStream error code.
+// If stream_handle is null, a temporary stream is created/synced/destroyed internally
+// (and the aclrtSynchronizeStream error code is returned). If the caller passes its own
+// stream (e.g. torch's current stream), the kernel is only *enqueued* — the caller owns
+// ordering/synchronization/timing — so tfa_run returns 0 without blocking. This keeps the
+// launch async, which is required for correct benchmarking via torch events (do_bench).
 int tfa_run(void *q, void *k, void *v, void *o, void *stream_handle)
 {
     if (!alloc_scratch_once()) {
@@ -137,11 +140,15 @@ int tfa_run(void *q, void *k, void *v, void *o, void *stream_handle)
         reinterpret_cast<float *>(g_scratch.pv_tile_fifo), reinterpret_cast<uint8_t *>(g_scratch.profile), stream,
         reinterpret_cast<uint8_t *>(g_scratch.cv_comm));
 
-    const int rc = aclrtSynchronizeStream(stream);
     if (own_stream) {
+        // We created this stream, so we must sync before destroying it; the sync
+        // also surfaces any aicore execution error as the return code.
+        const int rc = aclrtSynchronizeStream(stream);
         aclrtDestroyStream(stream);
+        return rc;
     }
-    return rc;
+    // Caller-provided stream: enqueue only, let the caller synchronize/time.
+    return 0;
 }
 
 } // extern "C"
