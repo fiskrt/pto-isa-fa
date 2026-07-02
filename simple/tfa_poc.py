@@ -28,9 +28,11 @@ def main():
 
     lib = ctypes.CDLL(LIB)
     lib.tfa_run.restype = ctypes.c_int
-    lib.tfa_run.argtypes = [ctypes.c_void_p] * 5
+    lib.tfa_run.argtypes = [ctypes.c_void_p] * 6
     lib.tfa_shape.restype = None
     lib.tfa_shape.argtypes = [ctypes.POINTER(ctypes.c_int)] * 3
+    lib.tfa_workspace_size.restype = ctypes.c_size_t
+    lib.tfa_workspace_size.argtypes = []
 
     s0 = ctypes.c_int(0)
     head = ctypes.c_int(0)
@@ -51,6 +53,11 @@ def main():
     kt = k.t().contiguous()  # [HEAD, S1] as the kernel expects
     o = torch.zeros(S0, HEAD, dtype=torch.float32, device=dev)
 
+    # Kernel scratch: allocate one workspace block here and hand it to the kernel.
+    ws_bytes = lib.tfa_workspace_size()
+    workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=dev)
+    print(f"[poc] workspace = {ws_bytes} bytes")
+
     # Launch on torch's own current stream, so it is ordered after the Q/K/V tensor creation.
     stream = torch.npu.current_stream().npu_stream
     rc = lib.tfa_run(
@@ -58,6 +65,7 @@ def main():
         ctypes.c_void_p(kt.data_ptr()),
         ctypes.c_void_p(v.data_ptr()),
         ctypes.c_void_p(o.data_ptr()),
+        ctypes.c_void_p(workspace.data_ptr()),
         ctypes.c_void_p(stream),
     )
     torch.npu.synchronize()

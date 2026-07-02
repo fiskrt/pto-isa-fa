@@ -50,7 +50,6 @@ constexpr size_t profile_bytes = kFaProfileBytesPerBlock * block_rows;
 constexpr size_t cv_comm_bytes = static_cast<size_t>(S0 / CUBE_S0) * kFaCvCommSlotBytes;
 
 struct Scratch {
-    bool init = false;
     void *p_tile_fifo = nullptr;   // half
     void *exp_max_ififo = nullptr; // float
     void *global_sum = nullptr;    // float
@@ -61,28 +60,48 @@ struct Scratch {
     void *profile = nullptr;       // uint8
     void *cv_comm = nullptr;       // uint8
 };
-Scratch g_scratch;
 
-bool malloc_dev(void **p, size_t bytes)
+// The nine scratch buffers, in the order they are carved out of the single
+// caller-provided workspace block. Keep this array in sync with Scratch's member
+// order and the dst[] table in carve_workspace().
+constexpr size_t kScratchSizes[] = {
+    p_fifo_bytes_half, exp_max_ififo_bytes, gsum_bytes,    gsum_bytes,   o_parts_bytes,
+    qk_fifo_bytes,     pv_fifo_bytes,       profile_bytes, cv_comm_bytes,
+};
+constexpr size_t kNumScratch = sizeof(kScratchSizes) / sizeof(kScratchSizes[0]);
+constexpr size_t kWsAlign = 512; // each sub-buffer is 512-byte aligned
+
+constexpr size_t align_up(size_t x)
 {
-    return aclrtMalloc(p, bytes, ACL_MEM_MALLOC_HUGE_FIRST) == ACL_SUCCESS;
+    return (x + kWsAlign - 1) & ~(kWsAlign - 1);
 }
 
-bool alloc_scratch_once()
+// Total bytes the workspace must hold (assuming a 512-byte-aligned base).
+size_t workspace_bytes()
 {
-    if (g_scratch.init) {
-        return true;
+    size_t off = 0;
+    for (size_t i = 0; i < kNumScratch; ++i) {
+        off = align_up(off);
+        off += kScratchSizes[i];
     }
-    if (!malloc_dev(&g_scratch.p_tile_fifo, p_fifo_bytes_half) ||
-        !malloc_dev(&g_scratch.exp_max_ififo, exp_max_ififo_bytes) ||
-        !malloc_dev(&g_scratch.global_sum, gsum_bytes) || !malloc_dev(&g_scratch.exp_max, gsum_bytes) ||
-        !malloc_dev(&g_scratch.o_parts, o_parts_bytes) || !malloc_dev(&g_scratch.qk_tile_fifo, qk_fifo_bytes) ||
-        !malloc_dev(&g_scratch.pv_tile_fifo, pv_fifo_bytes) || !malloc_dev(&g_scratch.profile, profile_bytes) ||
-        !malloc_dev(&g_scratch.cv_comm, cv_comm_bytes)) {
-        return false;
+    return off;
+}
+
+// Slice the nine sub-buffers out of `base` at the same offsets workspace_bytes()
+// accounts for. `base` must be 512-byte aligned (torch NPU allocations are).
+void carve_workspace(void *base, Scratch &out)
+{
+    void **dst[kNumScratch] = {
+        &out.p_tile_fifo, &out.exp_max_ififo, &out.global_sum,  &out.exp_max, &out.o_parts,
+        &out.qk_tile_fifo, &out.pv_tile_fifo, &out.profile,     &out.cv_comm,
+    };
+    uintptr_t b = reinterpret_cast<uintptr_t>(base);
+    size_t off = 0;
+    for (size_t i = 0; i < kNumScratch; ++i) {
+        off = align_up(off);
+        *dst[i] = reinterpret_cast<void *>(b + off);
+        off += kScratchSizes[i];
     }
-    g_scratch.init = true;
-    return true;
 }
 
 } // namespace
@@ -103,18 +122,29 @@ void tfa_shape(int *s0, int *head, int *s1)
     }
 }
 
+// Bytes the caller must allocate for the workspace passed to tfa_run().
+size_t tfa_workspace_size()
+{
+    return workspace_bytes();
+}
+
 // Launch the FA kernel on device pointers taken from torch tensors.
+// `workspace` is a single caller-allocated device block of at least tfa_workspace_size()
+// bytes (512-byte aligned); tfa_run slices the kernel's scratch buffers out of it. The
+// caller owns the workspace lifetime and must keep it alive until the launch completes.
 // If stream_handle is null, a temporary stream is created/synced/destroyed internally
 // (and the aclrtSynchronizeStream error code is returned). If the caller passes its own
 // stream (e.g. torch's current stream), the kernel is only *enqueued* — the caller owns
 // ordering/synchronization/timing — so tfa_run returns 0 without blocking. This keeps the
 // launch async, which is required for correct benchmarking via torch events (do_bench).
-int tfa_run(void *q, void *k, void *v, void *o, void *stream_handle)
+int tfa_run(void *q, void *k, void *v, void *o, void *workspace, void *stream_handle)
 {
-    if (!alloc_scratch_once()) {
-        fprintf(stderr, "[tfa] scratch allocation failed\n");
+    if (workspace == nullptr) {
+        fprintf(stderr, "[tfa] workspace pointer is null\n");
         return -1;
     }
+    Scratch scratch;
+    carve_workspace(workspace, scratch);
 
     uint64_t ffts = 0;
     uint32_t ffts_len = 0;
@@ -133,12 +163,12 @@ int tfa_run(void *q, void *k, void *v, void *o, void *stream_handle)
     LaunchTFA<S0, HEAD_SIZE, S1, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, kFaCvFifoSize, false, false,
               kFaCvFifoConsSyncPeriod>(
         reinterpret_cast<uint16_t *>(ffts), reinterpret_cast<aclFloat16 *>(q), reinterpret_cast<aclFloat16 *>(k),
-        reinterpret_cast<aclFloat16 *>(v), reinterpret_cast<aclFloat16 *>(g_scratch.p_tile_fifo),
-        reinterpret_cast<float *>(g_scratch.exp_max_ififo), reinterpret_cast<float *>(g_scratch.global_sum),
-        reinterpret_cast<float *>(g_scratch.exp_max), reinterpret_cast<float *>(o),
-        reinterpret_cast<float *>(g_scratch.o_parts), reinterpret_cast<float *>(g_scratch.qk_tile_fifo),
-        reinterpret_cast<float *>(g_scratch.pv_tile_fifo), reinterpret_cast<uint8_t *>(g_scratch.profile), stream,
-        reinterpret_cast<uint8_t *>(g_scratch.cv_comm));
+        reinterpret_cast<aclFloat16 *>(v), reinterpret_cast<aclFloat16 *>(scratch.p_tile_fifo),
+        reinterpret_cast<float *>(scratch.exp_max_ififo), reinterpret_cast<float *>(scratch.global_sum),
+        reinterpret_cast<float *>(scratch.exp_max), reinterpret_cast<float *>(o),
+        reinterpret_cast<float *>(scratch.o_parts), reinterpret_cast<float *>(scratch.qk_tile_fifo),
+        reinterpret_cast<float *>(scratch.pv_tile_fifo), reinterpret_cast<uint8_t *>(scratch.profile), stream,
+        reinterpret_cast<uint8_t *>(scratch.cv_comm));
 
     if (own_stream) {
         // We created this stream, so we must sync before destroying it; the sync

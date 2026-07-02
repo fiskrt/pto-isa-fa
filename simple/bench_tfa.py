@@ -23,9 +23,11 @@ LIB = os.path.join(HERE, "build", "lib", "libtfa_torch.so")
 def main():
     lib = ctypes.CDLL(LIB)
     lib.tfa_run.restype = ctypes.c_int
-    lib.tfa_run.argtypes = [ctypes.c_void_p] * 5
+    lib.tfa_run.argtypes = [ctypes.c_void_p] * 6
     lib.tfa_shape.restype = None
     lib.tfa_shape.argtypes = [ctypes.POINTER(ctypes.c_int)] * 3
+    lib.tfa_workspace_size.restype = ctypes.c_size_t
+    lib.tfa_workspace_size.argtypes = []
 
     s0 = ctypes.c_int(0); head = ctypes.c_int(0); s1 = ctypes.c_int(0)
     lib.tfa_shape(ctypes.byref(s0), ctypes.byref(head), ctypes.byref(s1))
@@ -43,14 +45,19 @@ def main():
     kt = k.t().contiguous()
     o = torch.zeros(S0, HEAD, dtype=torch.float32, device=dev)
 
+    ws_bytes = lib.tfa_workspace_size()
+    workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=dev)  # kept alive for all launches
+    print(f"[bench] workspace = {ws_bytes} bytes")
+
     q_ptr = ctypes.c_void_p(q.data_ptr())
     kt_ptr = ctypes.c_void_p(kt.data_ptr())
     v_ptr = ctypes.c_void_p(v.data_ptr())
     o_ptr = ctypes.c_void_p(o.data_ptr())
+    ws_ptr = ctypes.c_void_p(workspace.data_ptr())
 
     def run():
         stream = torch.npu.current_stream().npu_stream
-        lib.tfa_run(q_ptr, kt_ptr, v_ptr, o_ptr, ctypes.c_void_p(stream))
+        lib.tfa_run(q_ptr, kt_ptr, v_ptr, o_ptr, ws_ptr, ctypes.c_void_p(stream))
 
     # Correctness sanity check first.
     run()
