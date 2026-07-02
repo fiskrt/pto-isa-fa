@@ -77,6 +77,36 @@ def main():
         return kernel.run(q.data_ptr(), kt.data_ptr(), v.data_ptr(), o.data_ptr(),
                           workspace.data_ptr(), stream, S0, S1, causal)
 
+    # --- Baseline: torch_npu's fused attention op (npu_fused_infer_attention_score) ---
+    # BNSD layout [B, N, S, D] with a single batch/head; it takes the *untransposed* K
+    # [S1, HEAD] (unlike our kernel, which wants kt=[HEAD, S1]).
+    q_heads = kv_heads = 1
+    qb = q.view(1, q_heads, S0, HEAD)
+    kb = k.view(1, kv_heads, S1, HEAD)
+    vb = v.view(1, kv_heads, S1, HEAD)
+    # sparse_mode=3 uses a compressed upper-triangular mask (True == masked out).
+    # NOTE: sparse_mode=3 is bottom-right aligned (rightDownCausal); our kernel/ref use
+    # top-left aligned causal (query i attends key j<=i). They coincide only when S0==S1.
+    atten_mask = None
+    if causal:
+        atten_mask = torch.triu(torch.ones(2048, 2048, dtype=torch.bool, device=dev), diagonal=1)
+
+    def run_baseline():
+        # Torch op; it enqueues on the current stream. Returns [B, N, S0, HEAD].
+        return torch_npu.npu_fused_infer_attention_score(
+            qb,
+            kb,
+            vb,
+            atten_mask=atten_mask,
+            num_heads=q_heads,
+            scale=scale,
+            input_layout="BNSD",
+            num_key_value_heads=kv_heads,
+            pre_tokens=65535,
+            next_tokens=65535,
+            sparse_mode=3 if causal else 0,
+        )[0]
+
     # --- Correctness vs a torch reference: softmax(Q Kt * scale) @ V, all in fp32 ---
     run()
     torch.npu.synchronize()
@@ -101,6 +131,28 @@ def main():
         flops *= 0.5  # only the lower triangle is computed (standard causal convention)
     tflops = flops / (t_us * 1e-6) / 1e12
     print(f"[poc] latency = {t_us:.3f} us  (~{tflops:.2f} TFLOP/s, {flops/1e6:.1f} MFLOP)")
+
+    # --- Baseline correctness: vs the same torch reference, and vs our kernel output ---
+    ob = run_baseline().view(S0, HEAD).float()
+    torch.npu.synchronize()
+    base_vs_ref = (ob - ref).abs().max().item()
+    base_vs_ours = (ob - o).abs().max().item()
+    print(f"\n[base] npu_fused_infer_attention_score  (sparse_mode={3 if causal else 0})")
+    print(f"[base] ob   [0,:5] = {ob[0, :5].tolist()}")
+    print(f"[base] max abs diff vs ref  = {base_vs_ref:.6e}  (atol={atol:.0e})")
+    print(f"[base] max abs diff vs ours = {base_vs_ours:.6e}")
+    if causal and S0 != S1:
+        print("[base] NOTE: sparse_mode=3 is bottom-right aligned; ref/ours are top-left "
+              "aligned, so large causal diffs are expected when S0 != S1.")
+    base_passed = base_vs_ref < atol
+    print("[base] PASS" if base_passed else "[base] FAIL")
+
+    # --- Baseline benchmark: same do_bench harness as ours ---
+    tb_us = do_bench(run_baseline, warmup_iters=10, benchmark_iters=50, unit="us")
+    tb_flops = flops  # same problem size (and same 0.5 causal factor already applied above)
+    tb_tflops = tb_flops / (tb_us * 1e-6) / 1e12
+    print(f"[base] latency = {tb_us:.3f} us  (~{tb_tflops:.2f} TFLOP/s, {tb_flops/1e6:.1f} MFLOP)")
+    print(f"[base] speedup ours/baseline = {tb_us / t_us:.2f}x  (ours {t_us:.3f} us vs baseline {tb_us:.3f} us)")
 
     sys.exit(0 if passed else 1)
 
