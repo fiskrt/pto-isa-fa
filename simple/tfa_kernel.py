@@ -24,10 +24,13 @@ class TfaKernel:
         lib = self._lib
         lib.tfa_config.restype = None
         lib.tfa_config.argtypes = [ctypes.POINTER(ctypes.c_int)] * 3
+        lib.tfa_qk_preload_range.restype = None
+        lib.tfa_qk_preload_range.argtypes = [ctypes.POINTER(ctypes.c_int)] * 2
         lib.tfa_workspace_size.restype = ctypes.c_size_t
         lib.tfa_workspace_size.argtypes = [ctypes.c_int, ctypes.c_int]
         lib.tfa_run.restype = ctypes.c_int
-        lib.tfa_run.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        # q,k,v,o,ws,stream (6 ptrs) + s0, s1, causal, qk_preload
+        lib.tfa_run.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
 
     @property
     def config(self):
@@ -35,6 +38,13 @@ class TfaKernel:
         head, s0m, s1m = ctypes.c_int(0), ctypes.c_int(0), ctypes.c_int(0)
         self._lib.tfa_config(ctypes.byref(head), ctypes.byref(s0m), ctypes.byref(s1m))
         return head.value, s0m.value, s1m.value
+
+    @property
+    def qk_preload_range(self):
+        """(min, max) valid qk_preload values for run() with this build."""
+        lo, hi = ctypes.c_int(0), ctypes.c_int(0)
+        self._lib.tfa_qk_preload_range(ctypes.byref(lo), ctypes.byref(hi))
+        return lo.value, hi.value
 
     def validate_shape(self, s0, s1):
         """Raise ValueError unless (s0, s1) satisfy the kernel's tiling multiples."""
@@ -48,10 +58,11 @@ class TfaKernel:
         """Bytes to allocate for the workspace block for this shape."""
         return int(self._lib.tfa_workspace_size(s0, s1))
 
-    def run(self, q_ptr, k_ptr, v_ptr, o_ptr, ws_ptr, stream, s0, s1, causal=False):
+    def run(self, q_ptr, k_ptr, v_ptr, o_ptr, ws_ptr, stream, s0, s1, causal=False, qk_preload=0):
         """Enqueue the kernel on `stream`. Pointers are raw device addresses (ints from data_ptr()).
 
-        `causal` selects the lower-triangular masked variant. Returns the launcher's rc
+        `causal` selects the lower-triangular masked variant. `qk_preload` is the pipeline warmup
+        depth (0 = build default; valid range from qk_preload_range). Returns the launcher's rc
         (0 on enqueue when a caller stream is given).
         """
-        return self._lib.tfa_run(q_ptr, k_ptr, v_ptr, o_ptr, ws_ptr, stream, s0, s1, int(causal))
+        return self._lib.tfa_run(q_ptr, k_ptr, v_ptr, o_ptr, ws_ptr, stream, s0, s1, int(causal), int(qk_preload))

@@ -603,9 +603,10 @@ AICORE inline void compute_gu(PVPipe &pvPipe, int tile_id, int num_tiles, __gm__
     }
 }
 
-template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1, int QK_PRELOAD, int CV_FIFO_SIZE,
+template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1, int CV_FIFO_SIZE,
           bool INTERMEDIATE_CHECK, bool CAUSAL_MASK, int CV_FIFO_CONS_SYNC_PERIOD>
-__global__ AICORE void runTFA(uint32_t S0, uint32_t S1, __gm__ uint64_t *ffts_addr, __gm__ half *q, __gm__ half *k,
+__global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, __gm__ uint64_t *ffts_addr, __gm__ half *q,
+                              __gm__ half *k,
                               __gm__ half *v, __gm__ half *p_tile_fifo, __gm__ float *exp_max_ififo,
                               __gm__ float *global_sum_out, __gm__ float *exp_max_out, __gm__ float *o_out,
                               __gm__ float *o_parts_out, __gm__ float *qk_tile_fifo, __gm__ float *pv_tile_fifo,
@@ -642,7 +643,8 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, __gm__ uint64_t *ffts_ad
     // - Larger preload improves overlap (Cube/VEC concurrency) for long S1.
     // - Larger preload increases FIFO footprint (qkGlobalTensorNBuffers / pvGlobalTensorNBuffers /
     // guGlobalTensorNBuffers).
-    constexpr uint32_t qkPreloadNum = QK_PRELOAD;
+    // Runtime warmup depth (see header). Callers validate the range; the kernel trusts it.
+    const uint32_t qkPreloadNum = qk_preload;
 
     // Buffer counts for optional double-buffering (default 1)
     // - srcVecTNBuffers/xexpVecTNBuffers: Vec ping-pong for QK load and x_exp output
@@ -657,9 +659,9 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, __gm__ uint64_t *ffts_ad
     constexpr uint32_t vMatTNBuffers = 2;
     constexpr uint32_t qkp_tile_fifo_size = CV_FIFO_SIZE;
     constexpr uint32_t pv_tile_fifo_size = CV_FIFO_SIZE;
-    static_assert(qkPreloadNum >= 1, "qkPreloadNum must be >= 1");
     static_assert(CV_FIFO_CONS_SYNC_PERIOD >= 1, "CV_FIFO_CONS_SYNC_PERIOD must be >= 1");
-    static_assert((qkPreloadNum > 1) || (kTileFactor == 1), "qkPreloadNum must be > 1 unless kTileFactor == 1");
+    // qkPreloadNum is runtime now, so its bounds (1 <= n <= CV_FIFO_SIZE, and n > 1 unless
+    // kTileFactor == 1) are validated on the host in tfa_run before launch.
 
     // Define tile types for first QK matmul
     using TileMatQData =
@@ -1008,12 +1010,12 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, __gm__ uint64_t *ffts_ad
 
 // Host wrapper (NPU launch — skipped under costmodel)
 #ifndef __COSTMODEL
-template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1, int QK_PRELOAD, int CV_FIFO_SIZE,
+template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1, int CV_FIFO_SIZE,
           bool INTERMEDIATE_CHECK, bool CAUSAL_MASK, int CV_FIFO_CONS_SYNC_PERIOD>
-void LaunchTFA(uint32_t S0, uint32_t S1, uint16_t *ffts, aclFloat16 *q, aclFloat16 *k, aclFloat16 *v,
-               aclFloat16 *p_tile_fifo, float *exp_max_ififo, float *global_sum_out, float *exp_max_out, float *o_out,
-               float *o_parts_out, float *qk_tile_fifo, float *pv_tile_fifo, uint8_t *profile_data, aclrtStream stream,
-               uint8_t *cv_comm_buf)
+void LaunchTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uint16_t *ffts, aclFloat16 *q, aclFloat16 *k,
+               aclFloat16 *v, aclFloat16 *p_tile_fifo, float *exp_max_ififo, float *global_sum_out, float *exp_max_out,
+               float *o_out, float *o_parts_out, float *qk_tile_fifo, float *pv_tile_fifo, uint8_t *profile_data,
+               aclrtStream stream, uint8_t *cv_comm_buf)
 {
     // S0/S1 are runtime now; caller must ensure S0 % CUBE_S0 == 0 and S1 % TILE_S1 == 0.
     const uint32_t block_rows = S0 / CUBE_S0;
@@ -1042,57 +1044,59 @@ void LaunchTFA(uint32_t S0, uint32_t S1, uint16_t *ffts, aclFloat16 *q, aclFloat
     // }
 // #endif
 
-    runTFA<HEAD_SIZE, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, CV_FIFO_SIZE, INTERMEDIATE_CHECK, CAUSAL_MASK,
+    runTFA<HEAD_SIZE, CUBE_S0, CUBE_S1, TILE_S1, CV_FIFO_SIZE, INTERMEDIATE_CHECK, CAUSAL_MASK,
            CV_FIFO_CONS_SYNC_PERIOD><<<n_cores, nullptr, stream>>>(
-        S0, S1, (__gm__ uint64_t *)ffts, (half *)q, (half *)k, (half *)v, (half *)p_tile_fifo, exp_max_ififo,
+        S0, S1, qk_preload, (__gm__ uint64_t *)ffts, (half *)q, (half *)k, (half *)v, (half *)p_tile_fifo, exp_max_ififo,
         global_sum_out, exp_max_out, o_out, o_parts_out, qk_tile_fifo, pv_tile_fifo, cv_comm_buf, profile_data);
 }
 
 // Backward-compatible overload without profiling buffer
-template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1, int QK_PRELOAD, int CV_FIFO_SIZE,
+template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1, int CV_FIFO_SIZE,
           bool INTERMEDIATE_CHECK, bool CAUSAL_MASK, int CV_FIFO_CONS_SYNC_PERIOD>
-void LaunchTFA(uint32_t S0, uint32_t S1, uint16_t *ffts, aclFloat16 *q, aclFloat16 *k, aclFloat16 *v,
-               aclFloat16 *p_tile_fifo, float *exp_max_ififo, float *global_sum_out, float *exp_max_out, float *o_out,
-               float *o_parts_out, float *qk_tile_fifo, float *pv_tile_fifo, aclrtStream stream, uint8_t *cv_comm_buf)
+void LaunchTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uint16_t *ffts, aclFloat16 *q, aclFloat16 *k,
+               aclFloat16 *v, aclFloat16 *p_tile_fifo, float *exp_max_ififo, float *global_sum_out, float *exp_max_out,
+               float *o_out, float *o_parts_out, float *qk_tile_fifo, float *pv_tile_fifo, aclrtStream stream,
+               uint8_t *cv_comm_buf)
 {
-    LaunchTFA<HEAD_SIZE, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, CV_FIFO_SIZE, INTERMEDIATE_CHECK, CAUSAL_MASK,
-              CV_FIFO_CONS_SYNC_PERIOD>(S0, S1, ffts, q, k, v, p_tile_fifo, exp_max_ififo, global_sum_out, exp_max_out,
-                                        o_out, o_parts_out, qk_tile_fifo, pv_tile_fifo, nullptr, stream, cv_comm_buf);
+    LaunchTFA<HEAD_SIZE, CUBE_S0, CUBE_S1, TILE_S1, CV_FIFO_SIZE, INTERMEDIATE_CHECK, CAUSAL_MASK,
+              CV_FIFO_CONS_SYNC_PERIOD>(S0, S1, qk_preload, ffts, q, k, v, p_tile_fifo, exp_max_ififo, global_sum_out,
+                                        exp_max_out, o_out, o_parts_out, qk_tile_fifo, pv_tile_fifo, nullptr, stream,
+                                        cv_comm_buf);
 }
 
 // No generated_cases.h: the torch PoC drives one fixed shape, instantiated explicitly below.
 
 // S0/S1 are runtime kernel args now, so one instantiation covers every shape that shares
 // the compile-time tiling below. The uint32_t S0, S1 lead the runtime arg list.
-#define INSTANTIATE_TFA(HEAD, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, CAUSAL_MASK)                                 \
-    template void LaunchTFA<HEAD, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, kFaCvFifoSize, false, CAUSAL_MASK,       \
+#define INSTANTIATE_TFA(HEAD, CUBE_S0, CUBE_S1, TILE_S1, CAUSAL_MASK)                                            \
+    template void LaunchTFA<HEAD, CUBE_S0, CUBE_S1, TILE_S1, kFaCvFifoSize, false, CAUSAL_MASK,                  \
                             kFaCvFifoConsSyncPeriod>(                                                             \
-        uint32_t S0, uint32_t S1, uint16_t * ffts, aclFloat16 * q, aclFloat16 * k, aclFloat16 * v,               \
-        aclFloat16 * p_out, float *p_out_fp32, float *global_sum_out, float *exp_max_out, float *o_out,           \
-        float *o_parts_out, float *qk_out, float *pv_out, uint8_t *profile_data, aclrtStream stream,              \
+        uint32_t S0, uint32_t S1, uint32_t qk_preload, uint16_t * ffts, aclFloat16 * q, aclFloat16 * k,          \
+        aclFloat16 * v, aclFloat16 * p_out, float *p_out_fp32, float *global_sum_out, float *exp_max_out,        \
+        float *o_out, float *o_parts_out, float *qk_out, float *pv_out, uint8_t *profile_data, aclrtStream stream,\
         uint8_t *cv_comm_buf);                                                                                    \
-    template void LaunchTFA<HEAD, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, kFaCvFifoSize, false, CAUSAL_MASK,       \
+    template void LaunchTFA<HEAD, CUBE_S0, CUBE_S1, TILE_S1, kFaCvFifoSize, false, CAUSAL_MASK,                  \
                             kFaCvFifoConsSyncPeriod>(                                                             \
-        uint32_t S0, uint32_t S1, uint16_t * ffts, aclFloat16 * q, aclFloat16 * k, aclFloat16 * v,               \
-        aclFloat16 * p_out, float *p_out_fp32, float *global_sum_out, float *exp_max_out, float *o_out,           \
-        float *o_parts_out, float *qk_out, float *pv_out, aclrtStream stream, uint8_t *cv_comm_buf);              \
-    template void LaunchTFA<HEAD, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, kFaCvFifoSize, true, CAUSAL_MASK,        \
+        uint32_t S0, uint32_t S1, uint32_t qk_preload, uint16_t * ffts, aclFloat16 * q, aclFloat16 * k,          \
+        aclFloat16 * v, aclFloat16 * p_out, float *p_out_fp32, float *global_sum_out, float *exp_max_out,        \
+        float *o_out, float *o_parts_out, float *qk_out, float *pv_out, aclrtStream stream, uint8_t *cv_comm_buf);\
+    template void LaunchTFA<HEAD, CUBE_S0, CUBE_S1, TILE_S1, kFaCvFifoSize, true, CAUSAL_MASK,                   \
                             kFaCvFifoConsSyncPeriod>(                                                             \
-        uint32_t S0, uint32_t S1, uint16_t * ffts, aclFloat16 * q, aclFloat16 * k, aclFloat16 * v,               \
-        aclFloat16 * p_out, float *p_out_fp32, float *global_sum_out, float *exp_max_out, float *o_out,           \
-        float *o_parts_out, float *qk_out, float *pv_out, uint8_t *profile_data, aclrtStream stream,              \
+        uint32_t S0, uint32_t S1, uint32_t qk_preload, uint16_t * ffts, aclFloat16 * q, aclFloat16 * k,          \
+        aclFloat16 * v, aclFloat16 * p_out, float *p_out_fp32, float *global_sum_out, float *exp_max_out,        \
+        float *o_out, float *o_parts_out, float *qk_out, float *pv_out, uint8_t *profile_data, aclrtStream stream,\
         uint8_t *cv_comm_buf);                                                                                    \
-    template void LaunchTFA<HEAD, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, kFaCvFifoSize, true, CAUSAL_MASK,        \
+    template void LaunchTFA<HEAD, CUBE_S0, CUBE_S1, TILE_S1, kFaCvFifoSize, true, CAUSAL_MASK,                   \
                             kFaCvFifoConsSyncPeriod>(                                                             \
-        uint32_t S0, uint32_t S1, uint16_t * ffts, aclFloat16 * q, aclFloat16 * k, aclFloat16 * v,               \
-        aclFloat16 * p_out, float *p_out_fp32, float *global_sum_out, float *exp_max_out, float *o_out,           \
-        float *o_parts_out, float *qk_out, float *pv_out, aclrtStream stream, uint8_t *cv_comm_buf);
+        uint32_t S0, uint32_t S1, uint32_t qk_preload, uint16_t * ffts, aclFloat16 * q, aclFloat16 * k,          \
+        aclFloat16 * v, aclFloat16 * p_out, float *p_out_fp32, float *global_sum_out, float *exp_max_out,        \
+        float *o_out, float *o_parts_out, float *qk_out, float *pv_out, aclrtStream stream, uint8_t *cv_comm_buf);
 
 // Single compile-time tiling for the torch PoC: must match LaunchTFA<...> in tfa_torch_launch.cpp.
 // (HEAD, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, CAUSAL_MASK)  — S0/S1 are chosen at runtime.
 // Both CAUSAL_MASK variants are instantiated so tfa_run can pick one at runtime.
-INSTANTIATE_TFA(128, 128, 128, 256, 4, false)
-INSTANTIATE_TFA(128, 128, 128, 256, 4, true)
+INSTANTIATE_TFA(128, 128, 128, kFaTileS1, false)
+INSTANTIATE_TFA(128, 128, 128, kFaTileS1, true)
 
 #undef INSTANTIATE_TFA
 #endif // __COSTMODEL

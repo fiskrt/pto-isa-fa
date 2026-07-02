@@ -11,6 +11,10 @@ if(NOT DEFINED ENV{ASCEND_HOME_PATH})
 endif()
 set(ASCEND_HOME_PATH $ENV{ASCEND_HOME_PATH})
 
+# TILE_S1 tiling granularity (compile-time). Override: cmake -DFA_TILE_S1=512
+set(FA_TILE_S1 256 CACHE STRING "TILE_S1 tiling granularity")
+add_compile_definitions(FA_TILE_S1=${FA_TILE_S1})
+
 # AI Core arch for Ascend 910B1/B2/B3 (A2). Change to dav-c310 for Ascend910_9599 (A3).
 set(CCE_AICORE_ARCH "dav-c220")
 
@@ -50,3 +54,10 @@ target_link_directories(tfa_torch PUBLIC ${ASCEND_HOME_PATH}/lib64)
 target_link_libraries(tfa_torch PRIVATE
     fa_performance_kernel
     runtime stdc++ ascendcl m tiling_api platform c_sec dl nnopbase pthread)
+
+# Non-default tile builds get distinct lib names so both variants can be dlopen'd in one process
+# (same soname would make the loader reuse the first-loaded kernel, hiding the other's symbols).
+if(NOT FA_TILE_S1 EQUAL 256)
+    set_target_properties(fa_performance_kernel PROPERTIES OUTPUT_NAME "fa_performance_kernel_tile${FA_TILE_S1}")
+    set_target_properties(tfa_torch PROPERTIES OUTPUT_NAME "tfa_torch_tile${FA_TILE_S1}")
+endif()

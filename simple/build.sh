@@ -10,9 +10,14 @@ if [[ -z "${ASCEND_HOME_PATH:-}" ]]; then
     exit 1
 fi
 
-rm -rf build
-mkdir build
-cd build
-cmake .. >/dev/null
-make -j16
-echo "[build] done -> $(pwd)/lib/libtfa_torch.so"
+# Build one .so per TILE_S1 variant into its own dir (build/ = 256, build_tile512/ = 512).
+build_one() {
+    local tile=$1 dir=$2
+    rm -rf "$dir"
+    mkdir "$dir"
+    ( cd "$dir" && cmake -DFA_TILE_S1="$tile" .. >/dev/null && make -j16 )
+    echo "[build] done TILE_S1=$tile -> $dir/lib/$(ls "$dir"/lib/libtfa_torch*.so | xargs -n1 basename)"
+}
+
+build_one 256 build
+build_one 512 build_tile512

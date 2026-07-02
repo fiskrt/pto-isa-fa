@@ -19,7 +19,10 @@ See LICENSE in the root of the software repository for the full text of the Lice
 constexpr int kFaCvFifoSize = 8;
 constexpr int kFaCvFifoConsSyncPeriod = kFaCvFifoSize / 2;
 constexpr int kFaCubeS1 = 128;
-constexpr int kFaTileS1 = 256;
+#ifndef FA_TILE_S1
+#define FA_TILE_S1 256  // TILE_S1 tiling granularity; override at build with -DFA_TILE_S1=<n>
+#endif
+constexpr int kFaTileS1 = FA_TILE_S1;
 constexpr int kFaQkPreload = 4;
 constexpr std::size_t kFaProfileBytesPerBlock = 1024 * 3; // cube + two vec subblocks
 constexpr std::size_t kFaCvCommSlotBytes = 512U;
@@ -32,20 +35,22 @@ constexpr int kFaMaxCores = 24;
 
 // S0 (rows) and S1 (cols) are runtime arguments so a single instantiation serves arbitrary
 // shapes; only the tiling below (HEAD_SIZE/CUBE_S0/CUBE_S1/TILE_S1/...) is fixed at compile time.
+// qk_preload (pipeline warmup depth) is a *runtime* arg now so it can be swept without rebuilding.
+// Valid: 1 <= qk_preload <= CV_FIFO_SIZE, and qk_preload > 1 unless TILE_S1/CUBE_S1 == 1 (caller checks).
 template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1 = kFaCubeS1, int TILE_S1 = kFaTileS1,
-          int QK_PRELOAD = kFaQkPreload, int CV_FIFO_SIZE = kFaCvFifoSize, bool INTERMEDIATE_CHECK = false,
+          int CV_FIFO_SIZE = kFaCvFifoSize, bool INTERMEDIATE_CHECK = false,
           bool CAUSAL_MASK = false, int CV_FIFO_CONS_SYNC_PERIOD = kFaCvFifoConsSyncPeriod>
-void LaunchTFA(uint32_t S0, uint32_t S1, uint16_t *ffts, aclFloat16 *q, aclFloat16 *k, aclFloat16 *v,
-               aclFloat16 *p_tile_fifo, float *exp_max_ififo, float *global_sum_out, float *exp_max_out, float *o_out,
-               float *o_parts_out, float *qk_tile_fifo, float *pv_tile_fifo, uint8_t *profile_data, aclrtStream stream,
-               uint8_t *cv_comm_buf = nullptr);
+void LaunchTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uint16_t *ffts, aclFloat16 *q, aclFloat16 *k,
+               aclFloat16 *v, aclFloat16 *p_tile_fifo, float *exp_max_ififo, float *global_sum_out, float *exp_max_out,
+               float *o_out, float *o_parts_out, float *qk_tile_fifo, float *pv_tile_fifo, uint8_t *profile_data,
+               aclrtStream stream, uint8_t *cv_comm_buf = nullptr);
 
 // Overload without profiling buffer.
-template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1, int QK_PRELOAD, int CV_FIFO_SIZE,
+template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1, int CV_FIFO_SIZE,
           bool INTERMEDIATE_CHECK, bool CAUSAL_MASK, int CV_FIFO_CONS_SYNC_PERIOD>
-void LaunchTFA(uint32_t S0, uint32_t S1, uint16_t *ffts, aclFloat16 *q, aclFloat16 *k, aclFloat16 *v,
-               aclFloat16 *p_tile_fifo, float *exp_max_ififo, float *global_sum_out, float *exp_max_out, float *o_out,
-               float *o_parts_out, float *qk_tile_fifo, float *pv_tile_fifo, aclrtStream stream,
+void LaunchTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uint16_t *ffts, aclFloat16 *q, aclFloat16 *k,
+               aclFloat16 *v, aclFloat16 *p_tile_fifo, float *exp_max_ififo, float *global_sum_out, float *exp_max_out,
+               float *o_out, float *o_parts_out, float *qk_tile_fifo, float *pv_tile_fifo, aclrtStream stream,
                uint8_t *cv_comm_buf = nullptr);
 
 #endif // FA_PERFORMANCE_KERNEL_H

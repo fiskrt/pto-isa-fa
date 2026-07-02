@@ -14,6 +14,7 @@ Run:
     /home/fskogh/famy/.fa_env/bin/python3 tfa_poc.py [--s0 128] [--s1 1024]
 """
 import argparse
+import csv
 import math
 import os
 import sys
@@ -32,26 +33,60 @@ ATOL = 1e-3  # same bar the kernel's own golden test uses (ResultCmp in main.cpp
 # sums i+1 keys), so the residual peaks ~4e-3 there and decays as rows attend more keys.
 CAUSAL_ATOL = 6e-3
 
+# The correctness check builds an fp32 [S0,S1] score matrix + mask (O(S0*S1)); at 64k that alone is
+# ~16 GiB and OOMs. Above this per-dim size we skip the reference and only benchmark (no diff/PASS).
+REF_MAX_S = 32768
+
+# Square shapes swept by the CSV mode: S0 == S1 == 1k, 2k, ..., 32k.
+SWEEP_SIZES = [1024, 2048, 4096, 8192, 16384, 32768, 64*1024, 128*1024]
+CSV_FIELDS = ["S0", "S1", "causal", "impl", "tflops", "ms"]
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+LIB256 = os.path.join(HERE, "build", "lib", "libtfa_torch.so")            # TILE_S1=256 (build.sh)
+LIB512 = os.path.join(HERE, "build_tile512", "lib", "libtfa_torch_tile512.so")  # TILE_S1=512
+
+# The one place to edit what the sweep/plot compares: label -> (libtfa_torch.so, qk_preload).
+# TILE_S1 is baked into the .so at build time; qk_preload is a runtime knob (0 = build default),
+# so sweeping preload needs no rebuild. Missing .so files are skipped. Valid qk_preload per build
+# is TfaKernel.qk_preload_range (currently 2..8).
+VARIANTS = {
+    "t256_p2": (LIB256, 2),
+    "t256_p4": (LIB256, 4),
+    "t256_p8": (LIB256, 8),
+    "t512_p2": (LIB512, 2),
+    "t512_p4": (LIB512, 4),
+    "t512_p8": (LIB512, 8),
+}
+
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--s0", type=int, default=128, help="query rows (multiple of s0_multiple)")
     p.add_argument("--s1", type=int, default=1024, help="key/value rows (multiple of s1_multiple)")
     p.add_argument("--causal", action="store_true", help="apply lower-triangular causal mask (attend to key j <= query i)")
+    p.add_argument("--csv", metavar="PATH", help="sweep SWEEP_SIZES x {causal,non-causal} and write a CSV here")
+    p.add_argument("--plot", metavar="CSV_PATH", help="read a CSV written by --csv and plot the speedup grid")
+    p.add_argument("--out", metavar="PATH", default="tfa_speedup.png", help="output image path for --plot")
     return p.parse_args()
 
 
-def main():
-    args = parse_args()
+def _bench_fn(fn, S0, S1, HEAD, causal):
+    """Time `fn` (returns nothing meaningful) and convert to (ms, tflops)."""
+    flops = 4.0 * S0 * S1 * HEAD  # QK: 2*S0*S1*HEAD, PV: 2*S0*S1*HEAD
+    if causal:
+        flops *= 0.5  # only the lower triangle is computed (standard causal convention)
+    t_us = do_bench(fn, warmup_iters=10, benchmark_iters=50, unit="us")
+    return t_us / 1e3, flops / (t_us * 1e-6) / 1e12
 
-    kernel = TfaKernel()
-    HEAD, s0_mult, s1_mult = kernel.config
-    S0, S1 = args.s0, args.s1
-    kernel.validate_shape(S0, S1)
-    causal = args.causal
-    print(f"[poc] kernel shape: S0={S0} HEAD={HEAD} S1={S1}  (multiples: S0%{s0_mult}, S1%{s1_mult})  causal={causal}")
 
-    torch.npu.set_device(0)
+def benchmark_one(variants, S0, S1, causal, verbose=True):
+    """Run + time every `ours` variant and the torch_npu baseline for one shape.
+
+    `variants` maps label -> (TfaKernel, qk_preload). Returns {label: {"ms", "tflops", "passed"}}
+    with the torch_npu baseline included under "torch_npu". All single-shape logic lives here so
+    both the CLI and the CSV sweep share it.
+    """
+    HEAD = next(iter(variants.values()))[0].config[0]
     dev = "npu:0"
     scale = 1.0 / math.sqrt(HEAD)
 
@@ -61,100 +96,173 @@ def main():
     k = (torch.randn(S1, HEAD, device=dev) * 0.1).to(torch.float16)  # logical K as [S1,HEAD]
     v = (torch.randn(S1, HEAD, device=dev) * 0.1).to(torch.float16)
     kt = k.t().contiguous()  # [HEAD, S1] as the kernel expects
-    o = torch.zeros(S0, HEAD, dtype=torch.float32, device=dev)
 
-    # Kernel scratch: allocate one workspace block here and hand it to the kernel.
-    # Kept alive for every launch below (the torch-stream path is async).
-    ws_bytes = kernel.workspace_size(S0, S1)
-    workspace = torch.empty(ws_bytes, dtype=torch.uint8, device=dev)
-    print(f"[poc] workspace = {ws_bytes // 2 ** 20} MiB")
+    # --- torch reference (fp32) for correctness: softmax(Q Kt * scale) @ V ---
+    # The [S0,S1] score matrix is O(S0*S1); skip it above REF_MAX_S to avoid OOM (benchmark only).
+    check = S0 <= REF_MAX_S and S1 <= REF_MAX_S
+    ref = None
+    if check:
+        scores = (q.float() @ kt.float()) * scale  # [S0, S1]
+        if causal:
+            mask = torch.ones(S0, S1, device=dev, dtype=torch.bool).tril()
+            scores = scores.masked_fill(~mask, float("-inf"))
+        ref = torch.softmax(scores, dim=-1) @ v.float()
+    else:
+        print(f"[poc] S={S0}>{REF_MAX_S}: skipping fp32 reference (would OOM); benchmark only, no correctness check")
+    atol = CAUSAL_ATOL if causal else ATOL
 
-    def run():
-        # Launch on torch's own current stream, so it is ordered after the tensor
-        # creation and timed correctly by do_bench's events. run() only enqueues
-        # here (no internal sync) — the caller owns synchronization.
-        stream = torch.npu.current_stream().npu_stream
-        return kernel.run(q.data_ptr(), kt.data_ptr(), v.data_ptr(), o.data_ptr(),
-                          workspace.data_ptr(), stream, S0, S1, causal)
+    results = {}
+
+    # --- Our variants (each is a kernel .so + a runtime qk_preload) ---
+    for label, (kernel, qk_preload) in variants.items():
+        kernel.validate_shape(S0, S1)
+        o = torch.zeros(S0, HEAD, dtype=torch.float32, device=dev)
+        workspace = torch.empty(kernel.workspace_size(S0, S1), dtype=torch.uint8, device=dev)
+
+        def run(kernel=kernel, o=o, workspace=workspace, qk_preload=qk_preload):
+            stream = torch.npu.current_stream().npu_stream
+            return kernel.run(q.data_ptr(), kt.data_ptr(), v.data_ptr(), o.data_ptr(),
+                              workspace.data_ptr(), stream, S0, S1, causal, qk_preload)
+
+        run()
+        torch.npu.synchronize()
+        max_abs = (o - ref).abs().max().item() if check else None
+        passed = (max_abs < atol) if check else None  # None = not checked (ref skipped)
+        ms, tflops = _bench_fn(run, S0, S1, HEAD, causal)
+        results[label] = {"ms": ms, "tflops": tflops, "passed": passed, "max_abs": max_abs}
+        # Free this variant's workspace before the next impl so resident buffers don't force the
+        # next kernel (esp. torch_npu's internal alloc) to malloc inside its timed loop.
+        del run, o, workspace  # run holds o/workspace via default args; drop all three
+        torch.npu.empty_cache()
 
     # --- Baseline: torch_npu's fused attention op (npu_fused_infer_attention_score) ---
-    # BNSD layout [B, N, S, D] with a single batch/head; it takes the *untransposed* K
-    # [S1, HEAD] (unlike our kernel, which wants kt=[HEAD, S1]).
-    q_heads = kv_heads = 1
-    qb = q.view(1, q_heads, S0, HEAD)
-    kb = k.view(1, kv_heads, S1, HEAD)
-    vb = v.view(1, kv_heads, S1, HEAD)
-    # sparse_mode=3 uses a compressed upper-triangular mask (True == masked out).
-    # NOTE: sparse_mode=3 is bottom-right aligned (rightDownCausal); our kernel/ref use
-    # top-left aligned causal (query i attends key j<=i). They coincide only when S0==S1.
-    atten_mask = None
-    if causal:
-        atten_mask = torch.triu(torch.ones(2048, 2048, dtype=torch.bool, device=dev), diagonal=1)
+    qb = q.view(1, 1, S0, HEAD)
+    kb = k.view(1, 1, S1, HEAD)
+    vb = v.view(1, 1, S1, HEAD)
+    # sparse_mode=3 uses a compressed upper-triangular mask (True == masked out), bottom-right
+    # aligned; our kernel/ref use top-left aligned causal. They coincide only when S0==S1.
+    atten_mask = torch.triu(torch.ones(2048, 2048, dtype=torch.bool, device=dev), diagonal=1) if causal else None
 
     def run_baseline():
-        # Torch op; it enqueues on the current stream. Returns [B, N, S0, HEAD].
         return torch_npu.npu_fused_infer_attention_score(
-            qb,
-            kb,
-            vb,
-            atten_mask=atten_mask,
-            num_heads=q_heads,
-            scale=scale,
-            input_layout="BNSD",
-            num_key_value_heads=kv_heads,
-            pre_tokens=65535,
-            next_tokens=65535,
-            sparse_mode=3 if causal else 0,
+            qb, kb, vb, atten_mask=atten_mask, num_heads=1, scale=scale,
+            input_layout="BNSD", num_key_value_heads=1,
+            pre_tokens=65535, next_tokens=65535, sparse_mode=3 if causal else 0,
         )[0]
 
-    # --- Correctness vs a torch reference: softmax(Q Kt * scale) @ V, all in fp32 ---
-    run()
-    torch.npu.synchronize()
-    scores = (q.float() @ kt.float()) * scale  # [S0, S1]
-    if causal:
-        # Match the kernel: query row i attends to key j only when j <= i (absolute indices).
-        mask = torch.ones(S0, S1, device=dev, dtype=torch.bool).tril()
-        scores = scores.masked_fill(~mask, float("-inf"))
-    ref = torch.softmax(scores, dim=-1) @ v.float()
-    max_abs = (o - ref).abs().max().item()
-    atol = CAUSAL_ATOL if causal else ATOL
-    print(f"[poc] o    [0,:5] = {o[0, :5].tolist()}")
-    print(f"[poc] ref  [0,:5] = {ref[0, :5].tolist()}")
-    print(f"[poc] max abs diff = {max_abs:.6e}  (atol={atol:.0e})")
-    passed = max_abs < atol
-    print("[poc] PASS" if passed else "[poc] FAIL")
+    if check:
+        ob = run_baseline().view(S0, HEAD).float()
+        torch.npu.synchronize()
+        base_max = (ob - ref).abs().max().item()
+    else:
+        base_max = None
+    base_passed = (base_max < atol) if check else None
+    ms, tflops = _bench_fn(run_baseline, S0, S1, HEAD, causal)
+    results["torch_npu"] = {"ms": ms, "tflops": tflops, "passed": base_passed, "max_abs": base_max}
 
-    # --- Benchmark ---
-    t_us = do_bench(run, warmup_iters=10, benchmark_iters=50, unit="us")
-    flops = 4.0 * S0 * S1 * HEAD  # QK: 2*S0*S1*HEAD, PV: 2*S0*S1*HEAD
-    if causal:
-        flops *= 0.5  # only the lower triangle is computed (standard causal convention)
-    tflops = flops / (t_us * 1e-6) / 1e12
-    print(f"[poc] latency = {t_us:.3f} us  (~{tflops:.2f} TFLOP/s, {flops/1e6:.1f} MFLOP)")
+    if verbose:
+        print(f"[poc] S0={S0} S1={S1} HEAD={HEAD} causal={causal}")
+        for label, r in results.items():
+            status = "SKIP" if r["passed"] is None else ("PASS" if r["passed"] else "FAIL")
+            diff = "  n/a   " if r["max_abs"] is None else f"{r['max_abs']:.2e}"
+            print(f"[{label:>12}] {r['tflops']:7.2f} TFLOP/s  {r['ms']*1e3:9.3f} us  diff={diff}  {status}")
+    return results
 
-    # --- Baseline correctness: vs the same torch reference, and vs our kernel output ---
-    ob = run_baseline().view(S0, HEAD).float()
-    torch.npu.synchronize()
-    base_vs_ref = (ob - ref).abs().max().item()
-    base_vs_ours = (ob - o).abs().max().item()
-    print(f"\n[base] npu_fused_infer_attention_score  (sparse_mode={3 if causal else 0})")
-    print(f"[base] ob   [0,:5] = {ob[0, :5].tolist()}")
-    print(f"[base] max abs diff vs ref  = {base_vs_ref:.6e}  (atol={atol:.0e})")
-    print(f"[base] max abs diff vs ours = {base_vs_ours:.6e}")
-    if causal and S0 != S1:
-        print("[base] NOTE: sparse_mode=3 is bottom-right aligned; ref/ours are top-left "
-              "aligned, so large causal diffs are expected when S0 != S1.")
-    base_passed = base_vs_ref < atol
-    print("[base] PASS" if base_passed else "[base] FAIL")
 
-    # --- Baseline benchmark: same do_bench harness as ours ---
-    tb_us = do_bench(run_baseline, warmup_iters=10, benchmark_iters=50, unit="us")
-    tb_flops = flops  # same problem size (and same 0.5 causal factor already applied above)
-    tb_tflops = tb_flops / (tb_us * 1e-6) / 1e12
-    print(f"[base] latency = {tb_us:.3f} us  (~{tb_tflops:.2f} TFLOP/s, {tb_flops/1e6:.1f} MFLOP)")
-    print(f"[base] speedup ours/baseline = {tb_us / t_us:.2f}x  (ours {t_us:.3f} us vs baseline {tb_us:.3f} us)")
+def generate_csv(variants, path, sizes=SWEEP_SIZES):
+    """Sweep sizes x {causal, non-causal}, one tidy row per (shape, causal, impl)."""
+    rows = []
+    for S in sizes:
+        for causal in (False, True):
+            print(f"\n=== S0=S1={S} causal={causal} ===")
+            res = benchmark_one(variants, S, S, causal)
+            for label, r in res.items():
+                rows.append({"S0": S, "S1": S, "causal": causal, "impl": label,
+                             "tflops": r["tflops"], "ms": r["ms"]})
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        w.writeheader()
+        w.writerows(rows)
+    print(f"\n[csv] wrote {len(rows)} rows to {path}")
 
-    sys.exit(0 if passed else 1)
+
+def plot_csv(csv_path, out_path):
+    """Plot a grid colored by <variant>/torch_npu TFLOP/s (green = ours faster, red = slower).
+
+    One row per (ours variant, causal); one column per size. Every impl in the CSV except
+    torch_npu is treated as an ours-variant, so adding tile sizes just adds rows automatically.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
+
+    # data[(causal, S)] = {impl: tflops}
+    data = {}
+    with open(csv_path) as f:
+        for row in csv.DictReader(f):
+            key = (row["causal"] == "True", int(row["S0"]))
+            data.setdefault(key, {})[row["impl"]] = float(row["tflops"])
+
+    sizes = sorted({S for _, S in data})
+    variants = sorted({impl for d in data.values() for impl in d} - {"torch_npu"})
+    # Rows = every (variant, causal) pair; each colored by that variant's speedup vs torch_npu.
+    rows = [(v, c) for v in variants for c in (False, True)]
+    ratio = [[data[(c, S)][v] / data[(c, S)]["torch_npu"] for S in sizes] for v, c in rows]
+
+    fig, ax = plt.subplots(figsize=(1.5 * len(sizes) + 1.5, 0.9 * len(rows) + 1))
+    lo = min(min(r) for r in ratio)
+    hi = max(max(r) for r in ratio)
+    norm = TwoSlopeNorm(vmin=min(lo, 0.99), vcenter=1.0, vmax=max(hi, 1.01))
+    ax.imshow(ratio, cmap="RdYlGn", norm=norm, aspect="auto")
+
+    ax.set_xticks(range(len(sizes)))
+    ax.set_xticklabels([f"{S // 1024}k" for S in sizes])
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([f"{v}\ncausal={c}" for v, c in rows])
+    ax.set_xlabel("S0 = S1")
+
+    for i, (v, c) in enumerate(rows):
+        for j, S in enumerate(sizes):
+            d = data[(c, S)]
+            ax.text(j, i, f"{ratio[i][j]:.2f}x\n{d[v]:.0f} vs {d['torch_npu']:.0f}\nTFLOP/s",
+                    ha="center", va="center", fontsize=8)
+
+    ax.set_title("Speedup ours / torch_npu  (green = ours faster)")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    print(f"[plot] wrote {out_path}")
+
+
+def main():
+    args = parse_args()
+
+    if args.plot:
+        plot_csv(args.plot, args.out)
+        return
+
+    torch.npu.set_device(0)
+    # Build the variant table: load one TfaKernel per unique .so (cached), skipping missing builds
+    # so a single-tile build still runs. Each variant is (kernel, qk_preload).
+    cache = {}
+    variants = {}
+    for label, (path, preload) in VARIANTS.items():
+        if not os.path.exists(path):
+            continue
+        if path not in cache:
+            cache[path] = TfaKernel(path)
+        variants[label] = (cache[path], preload)
+    if not variants:
+        raise FileNotFoundError(f"no kernel .so found; build first (bash build.sh). VARIANTS: {VARIANTS}")
+
+    if args.csv:
+        generate_csv(variants, args.csv)
+        plot_csv(args.csv, args.out)  # auto-plot the sweep we just wrote
+        return
+
+    res = benchmark_one(variants, args.s0, args.s1, args.causal)
+    # None == correctness skipped (large S); only fail on an actual False.
+    sys.exit(0 if all(r["passed"] is not False for r in res.values()) else 1)
 
 
 if __name__ == "__main__":

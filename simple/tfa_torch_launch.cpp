@@ -3,10 +3,10 @@
  *
  * Q/K/V come in as device pointers from torch tensors; O is written into a torch fp32 tensor.
  * All the intermediate FIFO / scratch buffers the kernel needs are sliced out of a single
- * caller-provided workspace block. Only the tiling (HEAD_SIZE / CUBE_S0 / CUBE_S1 / TILE_S1 /
- * QK_PRELOAD) is fixed at compile time; the sequence lengths S0 (rows) and S1 (cols) are chosen
- * at runtime by the caller, so a single instantiated kernel serves arbitrary shapes as long as
- * S0 % CUBE_S0 == 0 and S1 % TILE_S1 == 0.
+ * caller-provided workspace block. Only the tiling (HEAD_SIZE / CUBE_S0 / CUBE_S1 / TILE_S1) is
+ * fixed at compile time; the sequence lengths S0 (rows), S1 (cols) and the pipeline warmup depth
+ * qk_preload are chosen at runtime by the caller, so a single instantiated kernel serves arbitrary
+ * shapes as long as S0 % CUBE_S0 == 0 and S1 % TILE_S1 == 0.
  *
  * Expected tensor layouts (row-major, matching the kernel):
  *   q : [S0, HEAD]  float16
@@ -30,7 +30,6 @@ constexpr int HEAD_SIZE = 128;
 constexpr int CUBE_S0 = 128;
 constexpr int CUBE_S1 = kFaCubeS1;       // 128
 constexpr int TILE_S1 = kFaTileS1;       // 256
-constexpr int QK_PRELOAD = kFaQkPreload; // 4
 
 constexpr int tile_factor = TILE_S1 / CUBE_S1;
 
@@ -145,6 +144,18 @@ size_t tfa_workspace_size(int s0, int s1)
     return workspace_bytes(s0, s1);
 }
 
+// Valid qk_preload range for tfa_run(): [min, max]. min is 1 when tile_factor==1 else 2; max is the
+// FIFO depth. Lets a caller sweep qk_preload without knowing the build-time tiling. Args may be null.
+void tfa_qk_preload_range(int *min_preload, int *max_preload)
+{
+    if (min_preload) {
+        *min_preload = (tile_factor == 1) ? 1 : 2;
+    }
+    if (max_preload) {
+        *max_preload = kFaCvFifoSize;
+    }
+}
+
 // Launch the FA kernel on device pointers taken from torch tensors, for the given S0/S1.
 // `workspace` is a single caller-allocated device block of at least tfa_workspace_size(s0, s1)
 // bytes (512-byte aligned); tfa_run slices the kernel's scratch buffers out of it. The caller owns
@@ -154,7 +165,8 @@ size_t tfa_workspace_size(int s0, int s1)
 // current stream), the kernel is only *enqueued* — the caller owns ordering/synchronization/timing —
 // so tfa_run returns 0 without blocking. This keeps the launch async, which is required for correct
 // benchmarking via torch events (do_bench).
-int tfa_run(void *q, void *k, void *v, void *o, void *workspace, void *stream_handle, int s0, int s1, int causal)
+int tfa_run(void *q, void *k, void *v, void *o, void *workspace, void *stream_handle, int s0, int s1, int causal,
+            int qk_preload)
 {
     if (workspace == nullptr) {
         fprintf(stderr, "[tfa] workspace pointer is null\n");
@@ -163,6 +175,16 @@ int tfa_run(void *q, void *k, void *v, void *o, void *workspace, void *stream_ha
     if (s0 <= 0 || s1 <= 0 || (s0 % CUBE_S0) != 0 || (s1 % TILE_S1) != 0) {
         fprintf(stderr, "[tfa] invalid shape S0=%d S1=%d (need S0%%%d==0, S1%%%d==0)\n", s0, s1, CUBE_S0, TILE_S1);
         return -3;
+    }
+    // qk_preload <= 0 means "use the build default". Runtime warmup depth must fit the FIFO
+    // (1..kFaCvFifoSize) and be > 1 unless tile_factor == 1 (see runTFA / fa_performance_kernel.h).
+    if (qk_preload <= 0) {
+        qk_preload = kFaQkPreload;
+    }
+    if (qk_preload > kFaCvFifoSize || (qk_preload <= 1 && tile_factor != 1)) {
+        fprintf(stderr, "[tfa] invalid qk_preload=%d (need 1<=n<=%d, and n>1 unless tile_factor==1; tile_factor=%d)\n",
+                qk_preload, kFaCvFifoSize, tile_factor);
+        return -4;
     }
     Scratch scratch;
     carve_workspace(workspace, s0, s1, scratch);
@@ -185,9 +207,10 @@ int tfa_run(void *q, void *k, void *v, void *o, void *workspace, void *stream_ha
     // INSTANTIATE_TFA), so pick the matching one at runtime from the `causal` flag.
     auto launch = [&](auto causal_tag) {
         constexpr bool CAUSAL = decltype(causal_tag)::value;
-        LaunchTFA<HEAD_SIZE, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, kFaCvFifoSize, false, CAUSAL,
+        LaunchTFA<HEAD_SIZE, CUBE_S0, CUBE_S1, TILE_S1, kFaCvFifoSize, false, CAUSAL,
                   kFaCvFifoConsSyncPeriod>(
-            static_cast<uint32_t>(s0), static_cast<uint32_t>(s1), reinterpret_cast<uint16_t *>(ffts),
+            static_cast<uint32_t>(s0), static_cast<uint32_t>(s1), static_cast<uint32_t>(qk_preload),
+            reinterpret_cast<uint16_t *>(ffts),
             reinterpret_cast<aclFloat16 *>(q), reinterpret_cast<aclFloat16 *>(k), reinterpret_cast<aclFloat16 *>(v),
             reinterpret_cast<aclFloat16 *>(scratch.p_tile_fifo), reinterpret_cast<float *>(scratch.exp_max_ififo),
             /*global_sum_out=*/nullptr, /*exp_max_out=*/nullptr, reinterpret_cast<float *>(o),
