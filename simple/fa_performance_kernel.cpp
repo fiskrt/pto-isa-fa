@@ -166,11 +166,12 @@ AICORE inline void allocate_vec_tile_buffers(TileDataF_T (&srcTiles)[SrcBuffers]
                                              ReduceTileF_T &m2_global_max, ReduceTileF_T &l2_global_sum,
                                              ReduceTileF_T (&l1_exp_max)[ExpMaxBuffers],
                                              TileDataH_T (&x_expT)[XexpBuffers], TileOutT (&pvTile)[pvVecBuffers],
-                                             TileOutT &runningOTile, TileDataF_T &triu)
+                                             TileOutT &runningOTile, TileDataF_T &triu, TileDataH_T &causal_e)
 {
     constexpr std::size_t float_tile_bytes = tile_storage_bytes<TileDataF_T>();
     constexpr std::size_t reduce_tile_bytes = tile_storage_bytes<ReduceTileF_T>();
     constexpr std::size_t xexp_bytes = tile_buffer_total_bytes<TileDataH_T, XexpBuffers>();
+    constexpr std::size_t half_tile_bytes = tile_storage_bytes<TileDataH_T>(); // causal_e (fp16 i-j mask base)
     constexpr std::size_t out_tile_bytes = tile_storage_bytes<TileOutT>();
     constexpr std::size_t union_stride = (tile_storage_bytes<TileDataF_T>() > tile_storage_bytes<TileOutT>()) ?
                                              tile_storage_bytes<TileDataF_T>() :
@@ -178,7 +179,8 @@ AICORE inline void allocate_vec_tile_buffers(TileDataF_T (&srcTiles)[SrcBuffers]
     static_assert(SrcBuffers == pvVecBuffers, "src/pv ping-pong buffer counts must match for union allocation");
     constexpr std::size_t union_bytes = union_stride * SrcBuffers;
     constexpr std::size_t total_bytes = union_bytes + xexp_bytes + (reduce_tile_bytes * (3U + ExpMaxBuffers)) +
-                                        (float_tile_bytes / 8 * 1U) + (float_tile_bytes * 1U) + out_tile_bytes;
+                                        (float_tile_bytes / 8 * 1U) + (float_tile_bytes * 1U) + out_tile_bytes +
+                                        half_tile_bytes;
     static_assert(total_bytes <= MAX_VEC_UB_BYTES, "Vec tile UB allocation exceeds 192KB");
 
     uint32_t offset = 0;
@@ -207,9 +209,12 @@ AICORE inline void allocate_vec_tile_buffers(TileDataF_T (&srcTiles)[SrcBuffers]
 
     offset = assign_tile_buffers(l1_exp_max, offset);
 
-    uint32_t tail_offset = assign_tile_buffers(x_expT, offset);
+    offset = assign_tile_buffers(x_expT, offset);
 
-    (void)tail_offset;
+    TASSIGN(causal_e, offset);
+    offset += static_cast<uint32_t>(half_tile_bytes);
+
+    (void)offset;
 }
 
 // Helper to assign an accumulator tile to one of two ping-pong UB addresses (0x0 / 0x10000).
@@ -433,7 +438,8 @@ AICORE inline void compute_p(QKPipe &qkPipe, PPipe &pPipe, int tile_id, int row_
                              __gm__ float *exp_max_out, TileDataF_T &qkVecTile, TileDataH_T &x_expT,
                              TileDataF_T &input_reduce_tmp, ReduceTileF_T &m1_local_max, ReduceTileF_T &l1_local_sum,
                              ReduceTileF_T &m2_global_max, ReduceTileF_T &l2_global_sum,
-                             ReduceTileF_T &l1_exp_max_ififo, TileDataF_T triu, QKVecSlotGlobal &qkVecSlotGlobal,
+                             ReduceTileF_T &l1_exp_max_ififo, TileDataF_T triu, TileDataH_T causal_e,
+                             QKVecSlotGlobal &qkVecSlotGlobal,
                              PVecSlotGlobal &pVecSlotGlobal, uint64_t pTileEventId, int blk_idx)
 {
     constexpr uint32_t Cube_S0 = CUBE_S0;
@@ -504,11 +510,11 @@ AICORE inline void compute_p(QKPipe &qkPipe, PPipe &pPipe, int tile_id, int row_
         if (initFlag) {
             pto_macro_fa_softmax<true, HEAD_SIZE, CAUSAL_MASK>(
                 x_expT, qkVecTile, m1_local_max_slice, l1_local_sum_slice, m2_global_max_slice, l2_global_sum_slice,
-                l1_exp_max_slice, input_reduce_tmp, qkVecTile, triu, s0_index, s1_index);
+                l1_exp_max_slice, input_reduce_tmp, qkVecTile, triu, causal_e, s0_index, s1_index);
         } else {
             pto_macro_fa_softmax<false, HEAD_SIZE, CAUSAL_MASK>(
                 x_expT, qkVecTile, m1_local_max_slice, l1_local_sum_slice, m2_global_max_slice, l2_global_sum_slice,
-                l1_exp_max_slice, input_reduce_tmp, qkVecTile, triu, s0_index, s1_index);
+                l1_exp_max_slice, input_reduce_tmp, qkVecTile, triu, causal_e, s0_index, s1_index);
         }
 
         set_flag(PIPE_V, PIPE_MTE2, pTileEventId);
@@ -575,6 +581,11 @@ AICORE inline void compute_gu(PVPipe &pvPipe, int tile_id, int num_tiles, __gm__
         TPOP<PVPipe, PVVecGlobal, TileSplitAxis::TILE_UP_DOWN>(pvPipe, pvGlobal);
 
         if (tile_id == 0) {
+            // runningOTile is single-buffered and reused every row-block. With the per-block
+            // pipe_barrier gone (continuous cross-block flow), this MTE2 reload must wait for the
+            // previous block's MTE3 store of runningOTile to finish. Paired with the set_flag after
+            // the final-tile TSTORE below; primed by a one-time set_flag before the work loop.
+            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
             TLOAD(runningOTile, pvGlobal);
             set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
             wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
@@ -608,6 +619,9 @@ AICORE inline void compute_gu(PVPipe &pvPipe, int tile_id, int num_tiles, __gm__
             GlobalOutT outGlobal((__gm__ float *)(o_out + subblock_base_rows * o_seq_stride),
                                  typename GlobalOutT::Shape{}, typename GlobalOutT::Stride(o_seq_stride));
             TSTORE(outGlobal, runningOTile);
+            // Signal that this block's runningOTile store is issued so the next block's tile-0 reload
+            // (wait_flag above) can safely overwrite the buffer once the store completes.
+            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
         }
     }
 }
@@ -722,13 +736,39 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uin
     ReduceTileF_T l2_global_sum;
     ReduceTileF_T l1_exp_max_ififo[qkp_tile_fifo_size];
     TileDataH_T x_expT[xexpVecTNBuffers];
+    // Precomputed causal mask base E[i][j] = i - j (fp16, exact for our tile sizes). The per-diagonal
+    // additive mask is min(base_phase + E, 0) * kCausalMaskNeg, replacing the old per-row scalar TTRI.
+    TileDataH_T causal_e;
 
     using TileOutGuT = Tile<TileType::Vec, float, VecGuRows, HEAD_SIZE, BLayout::RowMajor, VecGuRows, HEAD_SIZE>;
     TileOutGuT pvVecTile[outOTileNBuffers];
     TileOutGuT runningOTile;
     allocate_vec_tile_buffers<TileDataF_T, ReduceTileF_T, TileDataH_T, TileOutGuT, srcVecTNBuffers, xexpVecTNBuffers,
                               outOTileNBuffers>(qkVecTile, m1_local_max, input_reduce_tmp, l1_local_sum, m2_global_max,
-                                                l2_global_sum, l1_exp_max_ififo, x_expT, pvVecTile, runningOTile, triu);
+                                                l2_global_sum, l1_exp_max_ififo, x_expT, pvVecTile, runningOTile, triu,
+                                                causal_e);
+
+    // Generate E[i][j] = i - j once (vec only, causal only). Row 0 is [0,-1,-2,...] via a descending
+    // TCI; row i is row 0 + i. This is a one-time scalar TCI + Vec_S0-1 vector adds, amortized over the
+    // whole kernel — the hot path then just adds a scalar and clamps (no per-diagonal-tile scalar loop).
+    if constexpr (DAV_VEC && CAUSAL_MASK) {
+        // Build E in fp32 (scalar half ops are illegal on aicore) in the triu scratch, then cast to
+        // fp16 once. triu is free here (only used during the work loop). Row 0 = [0,-1,-2,...] via a
+        // descending fp32 TCI; row i = row 0 + i.
+        using ERowF = Tile<TileType::Vec, float, 1, Tile_S1, BLayout::RowMajor, 1, Tile_S1>;
+        ERowF e_row0;
+        TASSIGN(e_row0, (uint64_t)triu.data());
+        TCI<ERowF, float, 1>(e_row0, 0.0f); // e_row0[j] = 0 - j
+        pipe_barrier(PIPE_V);
+        for (int i = 1; i < static_cast<int>(Vec_S0); ++i) {
+            ERowF e_rowi;
+            TASSIGN(e_rowi, (uint64_t)triu.data() + static_cast<uint64_t>(i) * Tile_S1 * sizeof(float));
+            TADDS(e_rowi, e_row0, static_cast<float>(i)); // e_rowi[j] = i - j
+        }
+        pipe_barrier(PIPE_V);
+        TCVT(causal_e, triu, RoundMode::CAST_ROUND); // fp32 E -> fp16 causal_e
+        pipe_barrier(PIPE_V);
+    }
 
     // This core's id in [0, n_cores). The host launches n_cores = min(block_rows, kFaMaxCores) cores;
     // each loops over the row-blocks the LPT scheduler below assigns to it. comm_slot and every FIFO /
@@ -845,6 +885,36 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uin
     for (uint32_t c = 0; c < n_cores; ++c) {
         core_load[c] = 0;
     }
+
+    // --- One-time pipeline credits for continuous cross-block flow. ---
+    // Previously these ping-pong credits were set at each row-block's entry and reclaimed by a full
+    // drain + pipe_barrier(PIPE_ALL) at its exit, forcing a fill/drain bubble at every boundary. We
+    // now prime them once here and drain once after the whole work loop, so a core's next row-block
+    // can start filling (QK + softmax) while the current block's PV/GU tail drains. The QK/P/PV GM
+    // FIFOs stay correct across the boundary because of the QK->P->PV->GU data dependency: a block's
+    // QK is fully consumed (by that block's PV, via vec's P) before the same core issues the next
+    // block's QK, so the per-block tile_id%SLOT_NUM addressing can never alias a live slot. The only
+    // single-buffered tiles that outlive a boundary are Q (cube) and runningOTile (vec); each gets a
+    // dedicated ping-pong handshake (EVENT_ID4 on MTE1->MTE2 for Q, EVENT_ID0 on MTE3->MTE2 for O).
+    if constexpr (DAV_CUBE) {
+        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+        set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+        set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+        set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+        set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+        set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
+        set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+        set_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
+        set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID4); // Q buffer-free credit (paired per row-block)
+    }
+    if constexpr (DAV_VEC) {
+        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
+        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+        set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0); // runningOTile store->reload credit (paired per block)
+    }
+
     for (uint32_t bh = 0; bh < batch * num_q_heads; ++bh) {
         for (int logical_block = static_cast<int>(block_rows) - 1; logical_block >= 0; --logical_block) {
         // num_tiles_s1 == the key tiles this row-block sweeps: rows past S1 attend every key, so a
@@ -854,6 +924,14 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uin
             const uint32_t diag_tiles = 1u + (static_cast<uint32_t>(logical_block) * Cube_S0) / Tile_S1;
             blk_weight = diag_tiles < full_tiles ? diag_tiles : full_tiles;
         }
+        // Scheduling weight != tile count: every row-block carries a fixed cost (Q load, softmax init,
+        // GU, and — under causal — the diagonal-tile masking) that a pure tile-count weight ignores.
+        // For causal the near-diagonal blocks are short (1-2 tiles), so that fixed cost dominates them
+        // and a tile-count LPT piles too many onto one core. Adding kSchedFixed models it so LPT counts
+        // short blocks closer to their true cost. Non-causal weights are uniform, so the constant does
+        // not change that balance. (num_tiles_s1 below stays the real tile count — this only steers LPT.)
+        constexpr uint32_t kSchedFixed = 2u;
+        const uint32_t sched_weight = blk_weight + kSchedFixed;
         // LPT step: give this triple to the currently least-loaded core.
         uint32_t best_core = 0;
         for (uint32_t c = 1; c < n_cores; ++c) {
@@ -861,7 +939,7 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uin
                 best_core = c;
             }
         }
-        core_load[best_core] += blk_weight;
+        core_load[best_core] += sched_weight;
         if (best_core != static_cast<uint32_t>(block_idx)) {
             continue; // this work item belongs to another core
         }
@@ -892,27 +970,17 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uin
         // an S0 > S1 causal block from walking off the end of K/V (its rows attend every key).
         const int num_tiles_s1 = static_cast<int>(blk_weight);
 
-        // Fresh pipeline state for this row-block (all buffers are drained at the end of the block).
+        // Fresh ping-pong indices for this row-block. The rolling credits primed once before the work
+        // loop keep the K/V/P/softmax ping-pong buffers protected across the boundary (no per-block
+        // barrier); only Q and runningOTile need the extra per-block handshakes.
         k_src_pingpong_id = 0;
         p_gu_src_pingpong_id = 0;
         pv_src_pingpong_id = 0;
 
-        // Per-block entry flags, bracketed by the matching drain at the end of the loop body.
+        // Q is single-buffered and reused every row-block: wait until the previous block's QK matmuls
+        // released it before reloading Q (paired with the set_flag after this block's steady loop).
         if constexpr (DAV_CUBE) {
-            set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
-            set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
-            set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
-            set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
-            set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
-            set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
-            set_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
-            set_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
-        }
-        if constexpr (DAV_VEC) {
-            set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-            set_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
-            set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-            set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+            wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID4);
         }
 
     // QK and P pre-computation (tile_id based)
@@ -937,7 +1005,7 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uin
                     qkPipe, pPipe, preload_tile, row_slice, exp_max_ififo_block, qk_tile_fifo_block, p_tile_fifo_block,
                     global_sum_block, exp_max_block, qkVecTile[p_gu_src_pingpong_id % srcVecTNBuffers],
                     x_expT[p_gu_src_pingpong_id % xexpVecTNBuffers], input_reduce_tmp, m1_local_max, l1_local_sum,
-                    m2_global_max, l2_global_sum, l1_exp_max_ififo[preload_tile % qkp_tile_fifo_size], triu,
+                    m2_global_max, l2_global_sum, l1_exp_max_ififo[preload_tile % qkp_tile_fifo_size], triu, causal_e,
                     qkVecSlotGlobal, pVecSlotGlobal, p_gu_src_pingpong_id % xexpVecTNBuffers, logical_block);
                 p_gu_src_pingpong_id++;
             }
@@ -974,7 +1042,7 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uin
                         qkVecTile[p_gu_src_pingpong_id % srcVecTNBuffers],
                         x_expT[p_gu_src_pingpong_id % xexpVecTNBuffers], input_reduce_tmp, m1_local_max, l1_local_sum,
                         m2_global_max, l2_global_sum, l1_exp_max_ififo[next_qk_tile % qkp_tile_fifo_size], triu,
-                        qkVecSlotGlobal, pVecSlotGlobal, p_gu_src_pingpong_id % xexpVecTNBuffers, logical_block);
+                        causal_e, qkVecSlotGlobal, pVecSlotGlobal, p_gu_src_pingpong_id % xexpVecTNBuffers, logical_block);
                     p_gu_src_pingpong_id++;
                 }
             }
@@ -1000,28 +1068,36 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uin
         }
     } // end steady-state tile loop for this row-block
 
-        // ---- Per-block drain, bracketed against the per-block entry flags above. ----
-        // Return every bracketing flag to its initial state and quiesce the pipeline so the next
-        // row-block can safely reuse the single-buffered Q / reduce / running-O tiles.
+        // ---- Per-block boundary: release Q for the next row-block. ----
+        // No pipe_barrier / full drain here: the rolling ping-pong credits and the QK->P->PV->GU
+        // FIFO dependency carry correctness across the boundary, letting the next block's fill overlap
+        // this block's PV/GU tail. This set (on MTE1, after all of this block's QK matmuls have read
+        // Q) pairs with the wait_flag(EVENT_ID4) at the top of the next block.
         if constexpr (DAV_CUBE) {
-            wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
-            wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
-            wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
-            wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
-            wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
-            wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
-            wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
-            wait_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
+            set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID4);
         }
-        if constexpr (DAV_VEC) {
-            wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-            wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
-            wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-            wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
-        }
-        pipe_barrier(PIPE_ALL);
         } // end logical_block loop for this (batch, q_head)
     } // end (batch, q_head) problem loop
+
+    // --- One-time drain: reclaim the credits primed before the work loop. ---
+    if constexpr (DAV_CUBE) {
+        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+        wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+        wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+        wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID2);
+        wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID3);
+        wait_flag(PIPE_FIX, PIPE_M, EVENT_ID0);
+        wait_flag(PIPE_FIX, PIPE_M, EVENT_ID1);
+        wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID4);
+    }
+    if constexpr (DAV_VEC) {
+        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
+        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+        wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    }
 
     pipe_barrier(PIPE_ALL);
     uint64_t tEnd = get_sys_cnt();

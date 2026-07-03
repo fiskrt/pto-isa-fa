@@ -15,6 +15,12 @@ See LICENSE in the root of the software repository for the full text of the Lice
 
 namespace pto {
 
+// Additive causal mask magnitude. The diagonal mask is min(base_phase + (i - j), 0) * kCausalMaskNeg:
+// 0 on attended positions, a large negative elsewhere. 1e9 (times the ~0.09 softmax scale) drives
+// exp() to 0 for every masked entry while staying well inside fp32 range (no inf/nan), so it behaves
+// like the old -inf fill but is produced with vector ops instead of a per-row scalar TTRI loop.
+constexpr float kCausalMaskNeg = 1e9f;
+
 // -----------------------------------------------------------------------------
 // FlashAttention streaming softmax (tile-level)
 //
@@ -44,12 +50,48 @@ constexpr AICORE inline float constexpr_inv_sqrt(float x)
     return 1.0f / constexpr_sqrt(x);
 }
 
+// Apply the causal mask to the on-diagonal QK tile using the precomputed E[i][j] = i - j (fp16).
+// A query at tile-row i attends key at tile-col j iff j <= base_phase + i, i.e. base_phase + E >= 0.
+// The additive mask is min(base_phase + E, 0) * kCausalMaskNeg: 0 where attended, large-negative
+// where masked. All ops are vectorized (TCVT/TADDS/TMINS/TMULS/TADD) — this replaces the old TTRI,
+// which built the triangle with a per-row scalar loop (set_vector_mask per row) that dominated the
+// diagonal tiles at short sequence lengths. Off-diagonal (below) tiles are fully attended (no mask).
+template <typename TileDataS1, typename TileDataD2>
+AICORE inline void apply_causal_diag_mask(TileDataS1 input_x, TileDataS1 triu, TileDataD2 causal_e, int s0_index,
+                                          int s1_index)
+{
+    if (s0_index / TileDataS1::Cols == s1_index / TileDataS1::Cols) {
+        const float base_phase = static_cast<float>(s0_index % TileDataS1::Cols);
+        TCVT(triu, causal_e, RoundMode::CAST_ROUND); // fp16 E=i-j -> fp32
+#if defined(__DAV_C220_VEC__)
+        pipe_barrier(PIPE_V);
+#endif
+        TADDS(triu, triu, base_phase); // base_phase + (i - j)
+#if defined(__DAV_C220_VEC__)
+        pipe_barrier(PIPE_V);
+#endif
+        TMINS(triu, triu, 0.0f); // keep only the masked (negative) part; attended -> 0
+#if defined(__DAV_C220_VEC__)
+        pipe_barrier(PIPE_V);
+#endif
+        TMULS(triu, triu, kCausalMaskNeg); // scale to a large negative additive mask
+#if defined(__DAV_C220_VEC__)
+        pipe_barrier(PIPE_V);
+#endif
+        TADD(input_x, input_x, triu);
+#if defined(__DAV_C220_VEC__)
+        pipe_barrier(PIPE_V);
+#endif
+    }
+}
+
 template <int HEAD_SIZE, bool CAUSAL_MASK, typename ReduceTileD1, typename TileDataD2, typename TileDataS1>
 AICORE inline void softmax_opt_fa_init_impl(TileDataD2 __out__ x_exp, TileDataS1 __in__ input_x,
                                             ReduceTileD1 __out__ local_max, ReduceTileD1 __out__ local_sum,
                                             ReduceTileD1 __out__ new_global_max, ReduceTileD1 __out__ new_global_sum,
                                             ReduceTileD1 __out__ exp_max, TileDataS1 __out__ tmp_float,
-                                            TileDataS1 __out__ p_tile_f32, TileDataS1 triu, int s0_index, int s1_index)
+                                            TileDataS1 __out__ p_tile_f32, TileDataS1 triu, TileDataD2 causal_e,
+                                            int s0_index, int s1_index)
 {
     (void)local_max;
     (void)exp_max;
@@ -63,21 +105,7 @@ AICORE inline void softmax_opt_fa_init_impl(TileDataD2 __out__ x_exp, TileDataS1
     Tile1D_fp32 p_tile_f32_1d;
     Tile1D_out x_exp_1d;
     if constexpr (CAUSAL_MASK) {
-        if (s0_index / TileDataS1::Cols == s1_index / TileDataS1::Cols) {
-            constexpr float negInf = -3.40282e+38;
-            TTRI<TileDataS1, 1>(triu, 1 + (s0_index % TileDataS1::Cols));
-#if defined(__DAV_C220_VEC__)
-            pipe_barrier(PIPE_V);
-#endif
-            TMULS(triu, triu, negInf);
-#if defined(__DAV_C220_VEC__)
-            pipe_barrier(PIPE_V);
-#endif
-            TADD(input_x, input_x, triu);
-#if defined(__DAV_C220_VEC__)
-            pipe_barrier(PIPE_V);
-#endif
-        }
+        apply_causal_diag_mask<TileDataS1, TileDataD2>(input_x, triu, causal_e, s0_index, s1_index);
     }
     // FA2.0 init mode
     TROWMAX(new_global_max, input_x, tmp_float);
@@ -103,7 +131,7 @@ AICORE inline void softmax_opt_fa_not_init_impl(TileDataD2 __out__ x_exp, TileDa
                                                 ReduceTileD1 __out__ new_global_max,
                                                 ReduceTileD1 __out__ new_global_sum, ReduceTileD1 __out__ exp_max,
                                                 TileDataS1 __out__ tmp_float, TileDataS1 __out__ p_tile_f32,
-                                                TileDataS1 triu, int s0_index, int s1_index)
+                                                TileDataS1 triu, TileDataD2 causal_e, int s0_index, int s1_index)
 {
     constexpr float scale = constexpr_inv_sqrt(HEAD_SIZE);
 
@@ -122,21 +150,7 @@ AICORE inline void softmax_opt_fa_not_init_impl(TileDataD2 __out__ x_exp, TileDa
     Tile1D_out x_exp_1d;
 
     if constexpr (CAUSAL_MASK) {
-        if (s0_index / TileDataS1::Cols == s1_index / TileDataS1::Cols) {
-            constexpr float negInf = -3.40282e+38;
-            TTRI<TileDataS1, 1>(triu, 1 + (s0_index % TileDataS1::Cols));
-#if defined(__DAV_C220_VEC__)
-            pipe_barrier(PIPE_V);
-#endif
-            TMULS(triu, triu, negInf);
-#if defined(__DAV_C220_VEC__)
-            pipe_barrier(PIPE_V);
-#endif
-            TADD(input_x, input_x, triu);
-#if defined(__DAV_C220_VEC__)
-            pipe_barrier(PIPE_V);
-#endif
-        }
+        apply_causal_diag_mask<TileDataS1, TileDataD2>(input_x, triu, causal_e, s0_index, s1_index);
     }
     // FA2.0 streaming mode (not first tile): update (global_max, global_sum) and rescale old sums.
     TROWMAX(local_max, input_x, tmp_float);
@@ -189,17 +203,18 @@ AICORE inline void pto_macro_fa_softmax(TileDataD2 __out__ x_exp, TileDataS1 __i
                                         ReduceTileD1 __out__ local_max, ReduceTileD1 __out__ local_sum,
                                         ReduceTileD1 __in__ new_global_max, ReduceTileD1 __out__ new_global_sum,
                                         ReduceTileD1 __out__ exp_max, TileDataS1 __out__ input_reduce_tmp,
-                                        TileDataS1 __out__ p_tile_fp32, TileDataS1 triu, int s0_index, int s1_index)
+                                        TileDataS1 __out__ p_tile_fp32, TileDataS1 triu, TileDataD2 causal_e,
+                                        int s0_index, int s1_index)
 {
     if (s1_index <= s0_index || !CAUSAL_MASK) {
         if constexpr (init) {
             softmax_opt_fa_init_impl<HEAD_SIZE, CAUSAL_MASK, ReduceTileD1, TileDataD2, TileDataS1>(
                 x_exp, input_x, local_max, local_sum, new_global_max, new_global_sum, exp_max, input_reduce_tmp,
-                p_tile_fp32, triu, s0_index, s1_index);
+                p_tile_fp32, triu, causal_e, s0_index, s1_index);
         } else {
             softmax_opt_fa_not_init_impl<HEAD_SIZE, CAUSAL_MASK, ReduceTileD1, TileDataD2, TileDataS1>(
                 x_exp, input_x, local_max, local_sum, new_global_max, new_global_sum, exp_max, input_reduce_tmp,
-                p_tile_fp32, triu, s0_index, s1_index);
+                p_tile_fp32, triu, causal_e, s0_index, s1_index);
         }
     } else if constexpr (CAUSAL_MASK) {
         TMULS(x_exp, x_exp, 0.0);
