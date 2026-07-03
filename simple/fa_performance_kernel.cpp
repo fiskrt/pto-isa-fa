@@ -235,7 +235,7 @@ template <typename QKPipe, int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1,
 AICORE inline void compute_qk(QKPipe &qkPipe, int tile_id, int sub_tile_id, __gm__ half *q, __gm__ half *k,
                               __gm__ float *qk_tile_fifo, TileMatQData &qMatTile, TileMatKData &kMatTile,
                               TileQKData &qkAccTile, QKSlotGlobal &qkSlotGlobal, uint64_t qkMatTileEventId,
-                              int accTileEvtID, int blk_idx)
+                              int accTileEvtID, int blk_idx, int64_t q_seq_stride, int64_t kv_seq_stride)
 {
     if constexpr (DAV_CUBE) {
         constexpr uint32_t Cube_S0 = CUBE_S0;
@@ -261,13 +261,17 @@ AICORE inline void compute_qk(QKPipe &qkPipe, int tile_id, int sub_tile_id, __gm
                 return;
             }
         }
+        // Seq (row/col) strides are runtime so the same tile loads serve BNSD (seq_stride == HEAD_SIZE)
+        // and, in future, BSND (seq_stride == num_heads * HEAD_SIZE). The head dim stays contiguous
+        // (stride 1); only the sequence-axis stride is DYNAMIC.
         using GlobalDataQ =
-            GlobalTensor<half, pto::Shape<1, 1, 1, Cube_S0, HEAD_SIZE>, pto::Stride<1, 1, 1, HEAD_SIZE, 1>>;
+            GlobalTensor<half, pto::Shape<1, 1, 1, Cube_S0, HEAD_SIZE>, pto::Stride<1, 1, 1, pto::DYNAMIC, 1>>;
         using GlobalDataK = GlobalTensor<half, pto::Shape<1, 1, 1, HEAD_SIZE, Cube_S1>,
-                                         pto::Stride<1, 1, 1, 1, HEAD_SIZE>, Layout::DN>; // BNSD - (N, K) layout
+                                         pto::Stride<1, 1, 1, 1, pto::DYNAMIC>, Layout::DN>; // BNSD - (N, K) layout
 
-        GlobalDataQ qGlobal(q);
-        GlobalDataK kGlobal(k + s1_index * HEAD_SIZE);
+        GlobalDataQ qGlobal(q, typename GlobalDataQ::Shape{}, typename GlobalDataQ::Stride(q_seq_stride));
+        GlobalDataK kGlobal(k + s1_index * kv_seq_stride, typename GlobalDataK::Shape{},
+                            typename GlobalDataK::Stride(kv_seq_stride));
 
         wait_flag(PIPE_MTE1, PIPE_MTE2, qkMatTileEventId);
 
@@ -324,7 +328,7 @@ template <typename PPipe, typename PVPipe, int HEAD_SIZE, int CUBE_S0, int CUBE_
 AICORE inline void compute_pv(PPipe &pPipe, PVPipe &pvPipe, int tile_id, int sub_tile_id, __gm__ half *v,
                               __gm__ half *p_tile_fifo, TileMatPData &pMatTile, TileMatVData &vMatTile,
                               TilePVData &pvAccTile, PSlotGlobal &pSlotGlobal, PVSlotGlobal &pvSlotGlobal,
-                              uint64_t svMatTileEventId, int accTileEvtID, int blk_idx)
+                              uint64_t svMatTileEventId, int accTileEvtID, int blk_idx, int64_t kv_seq_stride)
 {
     constexpr uint32_t Cube_S0 = CUBE_S0;
     constexpr uint32_t Cube_S1 = CUBE_S1;
@@ -354,12 +358,14 @@ AICORE inline void compute_pv(PPipe &pPipe, PVPipe &pvPipe, int tile_id, int sub
             }
         }
 
+        // Runtime seq stride (see compute_qk): BNSD -> HEAD_SIZE, BSND -> num_kv_heads * HEAD_SIZE.
         using GlobalVT =
-            GlobalTensor<half, pto::Shape<1, 1, 1, Cube_S1, HEAD_SIZE>, pto::Stride<1, 1, 1, HEAD_SIZE, 1>>;
+            GlobalTensor<half, pto::Shape<1, 1, 1, Cube_S1, HEAD_SIZE>, pto::Stride<1, 1, 1, pto::DYNAMIC, 1>>;
 
         wait_flag(PIPE_MTE1, PIPE_MTE2, svMatTileEventId);
 
-        GlobalVT vLoad((__gm__ half *)(v + s1_index * HEAD_SIZE));
+        GlobalVT vLoad((__gm__ half *)(v + s1_index * kv_seq_stride), typename GlobalVT::Shape{},
+                       typename GlobalVT::Stride(kv_seq_stride));
         TLOAD(vMatTile, vLoad);
 
         using PLoadGlobal = GlobalTensor<half, pto::Shape<1, 1, 1, Cube_S0, Cube_S1>, pto::Stride<1, 1, 1, Cube_S1, 1>>;
@@ -552,7 +558,8 @@ template <typename PVPipe, int HEAD_SIZE, int CUBE_S0, int TILE_S1, int PV_CV_FI
           typename ReduceTileF_T>
 AICORE inline void compute_gu(PVPipe &pvPipe, int tile_id, int num_tiles, __gm__ float *o_out,
                               __gm__ float *o_parts_out, TileOutT &runningOTile, TileOutT &pvVecTile,
-                              ReduceTileF_T &l1_exp_max_ififo, ReduceTileF_T &l2_global_sum, uint64_t guEventId)
+                              ReduceTileF_T &l1_exp_max_ififo, ReduceTileF_T &l2_global_sum, uint64_t guEventId,
+                              int64_t o_seq_stride)
 {
     constexpr uint32_t Cube_S0 = CUBE_S0;
     constexpr uint32_t Vec_S0 = Cube_S0 / VEC_CORES;
@@ -595,9 +602,11 @@ AICORE inline void compute_gu(PVPipe &pvPipe, int tile_id, int num_tiles, __gm__
         if (tile_id == num_tiles - 1) {
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+            // Runtime seq stride (see compute_qk): BNSD -> HEAD_SIZE, BSND -> num_q_heads * HEAD_SIZE.
             using GlobalOutT =
-                GlobalTensor<float, pto::Shape<1, 1, 1, Vec_S0, HEAD_SIZE>, pto::Stride<1, 1, 1, HEAD_SIZE, 1>>;
-            GlobalOutT outGlobal((__gm__ float *)(o_out + subblock_base_rows * HEAD_SIZE));
+                GlobalTensor<float, pto::Shape<1, 1, 1, Vec_S0, HEAD_SIZE>, pto::Stride<1, 1, 1, pto::DYNAMIC, 1>>;
+            GlobalOutT outGlobal((__gm__ float *)(o_out + subblock_base_rows * o_seq_stride),
+                                 typename GlobalOutT::Shape{}, typename GlobalOutT::Stride(o_seq_stride));
             TSTORE(outGlobal, runningOTile);
         }
     }
@@ -605,7 +614,10 @@ AICORE inline void compute_gu(PVPipe &pvPipe, int tile_id, int num_tiles, __gm__
 
 template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1, int CV_FIFO_SIZE,
           bool INTERMEDIATE_CHECK, bool CAUSAL_MASK, int CV_FIFO_CONS_SYNC_PERIOD>
-__global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, __gm__ uint64_t *ffts_addr, __gm__ half *q,
+__global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uint32_t batch, uint32_t num_q_heads,
+                              uint32_t num_kv_heads, int64_t q_batch_stride, int64_t q_head_stride,
+                              int64_t q_seq_stride, int64_t kv_batch_stride, int64_t kv_head_stride,
+                              int64_t kv_seq_stride, __gm__ uint64_t *ffts_addr, __gm__ half *q,
                               __gm__ half *k,
                               __gm__ half *v, __gm__ half *p_tile_fifo, __gm__ float *exp_max_ififo,
                               __gm__ float *global_sum_out, __gm__ float *exp_max_out, __gm__ float *o_out,
@@ -724,8 +736,12 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, __g
 #if defined(__DAV_C220_CUBE__) || defined(__DAV_C220_VEC__) // A5 defined macro, don't need to reassign
     const int block_idx = get_block_idx();
 #endif
-    const uint32_t n_cores =
-        (block_rows < static_cast<uint32_t>(kFaMaxCores)) ? block_rows : static_cast<uint32_t>(kFaMaxCores);
+    // Total independent row-blocks across the whole (batch x q_head x row_block) grid. Each is a
+    // self-contained online-softmax chain; the LPT loop below hands them out to the launched cores.
+    const uint32_t total_row_blocks = batch * num_q_heads * block_rows;
+    const uint32_t n_cores = (total_row_blocks < static_cast<uint32_t>(kFaMaxCores)) ?
+                                 total_row_blocks :
+                                 static_cast<uint32_t>(kFaMaxCores);
 
     // n_cores <= kFaMaxCores < kCvMaxCores, so this stays on the direct comm_slot == block_idx path.
     const bool use_cv_comm = (!INTERMEDIATE_CHECK) && (n_cores >= static_cast<uint32_t>(pto::kCvMaxCores));
@@ -805,36 +821,40 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, __g
     PVSlotGlobal pvSlotGlobal;
 
     // ---------------------------------------------------------------------------------------------
-    // Load-balanced row-block assignment (persistent kernel).
+    // Load-balanced work assignment (persistent kernel). Unit of work = one (batch, q_head, row-block)
+    // triple: a self-contained online-softmax chain over that head's K/V.
     //
-    // The host launches n_cores = min(block_rows, kFaMaxCores) cores; this loop hands each core the
-    // row-blocks it should compute. Under the causal mask the per-block cost grows with the row index
-    // (block b sweeps num_tiles_s1 = 1 + b*CUBE_S0/TILE_S1 key tiles), so the naive block_idx == row
-    // mapping leaves the low cores idle while the high cores run long. We instead schedule with
-    // Longest-Processing-Time-first (LPT): walk the row-blocks heaviest -> lightest and give each to
-    // the currently least-loaded core. This equalizes the summed per-core work (a robust
-    // generalization of pairing a light row with a heavy row that also handles row counts not
-    // divisible by the core count) and degenerates to plain round-robin for the non-causal rectangle,
-    // where every block costs the same. Every core runs the identical deterministic simulation and
-    // executes only the row-blocks that land on its own id. When block_rows <= n_cores each core gets
-    // exactly one row-block (a single row-block is a sequential softmax chain, so one-per-core is
-    // already makespan-optimal); the loop earns its keep once S0/CUBE_S0 exceeds the core count.
+    // We assign with a greedy longest-processing-time (LPT) pass: walk the work items heaviest ->
+    // lightest and give each to the currently least-loaded core. Under the causal mask a row-block's
+    // cost grows with its row index (block r sweeps min(1 + r*CUBE_S0/TILE_S1, full_tiles) key tiles);
+    // LPT balances that triangle and degenerates to round-robin for the non-causal rectangle. The
+    // argmin runs per work item, but it is only an O(n_cores<=24) scalar scan next to a full matmul
+    // pipeline — negligible — and it must stay per-item (not precomputed once per problem and reused):
+    // when block_rows is not a multiple of n_cores, the leftover blocks of each problem have to land on
+    // DIFFERENT cores across the B*H problems, which only the running core_load[] accumulation does.
+    // Reusing one problem's map instead piles every problem's leftovers on the same cores (e.g.
+    // block_rows=32, n_cores=24 -> 8 cores get 2 blocks and 16 get 1, every problem -> ~0.67 efficiency).
+    //
+    // Emission is problem-major (all of one (batch, q_head)'s row-blocks before the next) so the cores
+    // running concurrently stay on one problem's K/V in L2 — a single large problem otherwise loses
+    // ~20% throughput when batches are interleaved. Because every problem is identical, walking them in
+    // order keeps the running loads balanced while preserving that locality.
     // ---------------------------------------------------------------------------------------------
     const uint32_t full_tiles = S1 / Tile_S1;
     uint32_t core_load[kFaMaxCores];
     for (uint32_t c = 0; c < n_cores; ++c) {
         core_load[c] = 0;
     }
-    for (int logical_block = static_cast<int>(block_rows) - 1; logical_block >= 0; --logical_block) {
-        // Cost == the number of key tiles this row-block actually sweeps (must match the capped
-        // num_tiles_s1 computed below): rows past S1 attend every key, so a far-down causal block is
-        // no more expensive than a non-causal one, and the uncapped diagonal formula would mis-rank it.
+    for (uint32_t bh = 0; bh < batch * num_q_heads; ++bh) {
+        for (int logical_block = static_cast<int>(block_rows) - 1; logical_block >= 0; --logical_block) {
+        // num_tiles_s1 == the key tiles this row-block sweeps: rows past S1 attend every key, so a
+        // far-down causal block is capped at full_tiles (the non-causal width).
         uint32_t blk_weight = full_tiles;
         if constexpr (CAUSAL_MASK) {
             const uint32_t diag_tiles = 1u + (static_cast<uint32_t>(logical_block) * Cube_S0) / Tile_S1;
             blk_weight = diag_tiles < full_tiles ? diag_tiles : full_tiles;
         }
-        // Assign this row-block to the currently least-loaded core (LPT step).
+        // LPT step: give this triple to the currently least-loaded core.
         uint32_t best_core = 0;
         for (uint32_t c = 1; c < n_cores; ++c) {
             if (core_load[c] < core_load[best_core]) {
@@ -843,15 +863,29 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, __g
         }
         core_load[best_core] += blk_weight;
         if (best_core != static_cast<uint32_t>(block_idx)) {
-            continue; // this row-block belongs to another core
+            continue; // this work item belongs to another core
         }
 
-        // --- Per-block setup for the row-block this core just claimed. ---
+        // --- Per-block setup for the work item this core just claimed. ---
+        // GQA: consecutive groups of (num_q_heads / num_kv_heads) query heads share one kv head.
+        const uint32_t b = bh / num_q_heads;
+        const uint32_t q_head = bh % num_q_heads;
+        const uint32_t kv_head = q_head / (num_q_heads / num_kv_heads);
+        // Base of this problem. Q and O use the q-side strides; K and V use the kv-side strides. The
+        // head dim is contiguous (stride 1); only the sequence-axis stride is layout-dependent.
+        const size_t q_base = static_cast<size_t>(b) * static_cast<size_t>(q_batch_stride) +
+                              static_cast<size_t>(q_head) * static_cast<size_t>(q_head_stride);
+        const size_t kv_base = static_cast<size_t>(b) * static_cast<size_t>(kv_batch_stride) +
+                               static_cast<size_t>(kv_head) * static_cast<size_t>(kv_head_stride);
+
         const int block_offset_rows = logical_block * static_cast<int>(Cube_S0);
-        __gm__ half *q_block = q + block_offset_rows * HEAD_SIZE;
+        __gm__ half *q_block = q + q_base + static_cast<size_t>(block_offset_rows) * static_cast<size_t>(q_seq_stride);
+        __gm__ half *k_head = k + kv_base;
+        __gm__ half *v_head = v + kv_base;
         __gm__ float *global_sum_block = global_sum_out + block_offset_rows;
         __gm__ float *exp_max_block = exp_max_out + block_offset_rows;
-        __gm__ float *o_out_block = o_out + static_cast<size_t>(block_offset_rows) * static_cast<size_t>(HEAD_SIZE);
+        __gm__ float *o_out_block =
+            o_out + q_base + static_cast<size_t>(block_offset_rows) * static_cast<size_t>(q_seq_stride);
         __gm__ float *o_parts_block =
             o_parts_out + static_cast<size_t>(block_offset_rows) * static_cast<size_t>(HEAD_SIZE);
         // Actual key tiles this row-block sweeps == blk_weight from the scheduler above; the cap keeps
@@ -889,9 +923,9 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, __g
                 qkAccTileEvtID = assign_running_acc_tile(qkAccTile);
                 compute_qk<QKPipe, HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, CV_FIFO_CONS_SYNC_PERIOD,
                            INTERMEDIATE_CHECK, CAUSAL_MASK>(
-                    qkPipe, preload_tile, sub_tile, q_block, k, qk_tile_fifo_block, qMatTile[0],
+                    qkPipe, preload_tile, sub_tile, q_block, k_head, qk_tile_fifo_block, qMatTile[0],
                     kMatTile[k_src_pingpong_id % kMatTNBuffers], qkAccTile, qkSlotGlobal,
-                    k_src_pingpong_id % kMatTNBuffers, qkAccTileEvtID, logical_block);
+                    k_src_pingpong_id % kMatTNBuffers, qkAccTileEvtID, logical_block, q_seq_stride, kv_seq_stride);
                 k_src_pingpong_id++;
             }
         }
@@ -924,9 +958,9 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, __g
                 if (next_qk_tile != -1) {
                     compute_qk<QKPipe, HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, CV_FIFO_CONS_SYNC_PERIOD,
                                INTERMEDIATE_CHECK, CAUSAL_MASK>(
-                        qkPipe, next_qk_tile, sub_tile, q_block, k, qk_tile_fifo_block, qMatTile[0],
+                        qkPipe, next_qk_tile, sub_tile, q_block, k_head, qk_tile_fifo_block, qMatTile[0],
                         kMatTile[k_src_pingpong_id % kMatTNBuffers], qkAccTile, qkSlotGlobal,
-                        k_src_pingpong_id % kMatTNBuffers, qkAccTileEvtID, logical_block);
+                        k_src_pingpong_id % kMatTNBuffers, qkAccTileEvtID, logical_block, q_seq_stride, kv_seq_stride);
                     k_src_pingpong_id++;
                 }
             }
@@ -948,10 +982,10 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, __g
             if constexpr (DAV_CUBE) {
                 compute_pv<PPipe, PVPipe, HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, pv_tile_fifo_size,
                            CV_FIFO_CONS_SYNC_PERIOD, INTERMEDIATE_CHECK, CAUSAL_MASK>(
-                    pPipe, pvPipe, tile_id, sub_tile, v, p_tile_fifo_block,
+                    pPipe, pvPipe, tile_id, sub_tile, v_head, p_tile_fifo_block,
                     pMatTile[pv_src_pingpong_id % pMatTNBuffers], vMatTile[pv_src_pingpong_id % vMatTNBuffers],
                     pvAccTile, pSlotGlobal, pvSlotGlobal, pv_src_pingpong_id % vMatTNBuffers + PV_EVENT_ID0,
-                    pvAccTileEvtID, logical_block);
+                    pvAccTileEvtID, logical_block, kv_seq_stride);
                 pv_src_pingpong_id++;
             }
         }
@@ -961,7 +995,7 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, __g
                        INTERMEDIATE_CHECK, CAUSAL_MASK>(
                 pvPipe, tile_id, num_tiles_s1, o_out_block, o_parts_block, runningOTile,
                 pvVecTile[p_gu_src_pingpong_id % outOTileNBuffers], l1_exp_max_ififo[tile_id % qkp_tile_fifo_size],
-                l2_global_sum, p_gu_src_pingpong_id % outOTileNBuffers);
+                l2_global_sum, p_gu_src_pingpong_id % outOTileNBuffers, q_seq_stride);
             p_gu_src_pingpong_id++;
         }
     } // end steady-state tile loop for this row-block
@@ -986,7 +1020,8 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, __g
             wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
         }
         pipe_barrier(PIPE_ALL);
-    } // end per-core row-block loop
+        } // end logical_block loop for this (batch, q_head)
+    } // end (batch, q_head) problem loop
 
     pipe_barrier(PIPE_ALL);
     uint64_t tEnd = get_sys_cnt();
@@ -1012,7 +1047,10 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, __g
 #ifndef __COSTMODEL
 template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1, int CV_FIFO_SIZE,
           bool INTERMEDIATE_CHECK, bool CAUSAL_MASK, int CV_FIFO_CONS_SYNC_PERIOD>
-void LaunchTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uint16_t *ffts, aclFloat16 *q, aclFloat16 *k,
+void LaunchTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uint32_t batch, uint32_t num_q_heads,
+               uint32_t num_kv_heads, int64_t q_batch_stride, int64_t q_head_stride, int64_t q_seq_stride,
+               int64_t kv_batch_stride, int64_t kv_head_stride, int64_t kv_seq_stride, uint16_t *ffts, aclFloat16 *q,
+               aclFloat16 *k,
                aclFloat16 *v, aclFloat16 *p_tile_fifo, float *exp_max_ififo, float *global_sum_out, float *exp_max_out,
                float *o_out, float *o_parts_out, float *qk_tile_fifo, float *pv_tile_fifo, uint8_t *profile_data,
                aclrtStream stream, uint8_t *cv_comm_buf)
@@ -1020,9 +1058,11 @@ void LaunchTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uint16_t *ffts, ac
     // S0/S1 are runtime now; caller must ensure S0 % CUBE_S0 == 0 and S1 % TILE_S1 == 0.
     const uint32_t block_rows = S0 / CUBE_S0;
     // Persistent kernel: never launch more than kFaMaxCores cores. Each launched core loops over the
-    // row-blocks assigned to it (LPT-balanced for the causal mask) — see runTFA.
-    const uint32_t n_cores =
-        block_rows < static_cast<uint32_t>(kFaMaxCores) ? block_rows : static_cast<uint32_t>(kFaMaxCores);
+    // (batch, q_head, row-block) work items assigned to it (LPT-balanced for the causal mask) — see runTFA.
+    const uint32_t total_row_blocks = batch * num_q_heads * block_rows;
+    const uint32_t n_cores = total_row_blocks < static_cast<uint32_t>(kFaMaxCores) ?
+                                 total_row_blocks :
+                                 static_cast<uint32_t>(kFaMaxCores);
 
 // #if defined(__DAV_C220_CUBE__) || defined(__DAV_C220_VEC__)
 //     // Warm up all cores first, then prefetch q/k/v into L2
@@ -1046,51 +1086,56 @@ void LaunchTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uint16_t *ffts, ac
 
     runTFA<HEAD_SIZE, CUBE_S0, CUBE_S1, TILE_S1, CV_FIFO_SIZE, INTERMEDIATE_CHECK, CAUSAL_MASK,
            CV_FIFO_CONS_SYNC_PERIOD><<<n_cores, nullptr, stream>>>(
-        S0, S1, qk_preload, (__gm__ uint64_t *)ffts, (half *)q, (half *)k, (half *)v, (half *)p_tile_fifo, exp_max_ififo,
-        global_sum_out, exp_max_out, o_out, o_parts_out, qk_tile_fifo, pv_tile_fifo, cv_comm_buf, profile_data);
+        S0, S1, qk_preload, batch, num_q_heads, num_kv_heads, q_batch_stride, q_head_stride, q_seq_stride,
+        kv_batch_stride, kv_head_stride, kv_seq_stride, (__gm__ uint64_t *)ffts, (half *)q, (half *)k, (half *)v,
+        (half *)p_tile_fifo, exp_max_ififo, global_sum_out, exp_max_out, o_out, o_parts_out, qk_tile_fifo,
+        pv_tile_fifo, cv_comm_buf, profile_data);
 }
 
 // Backward-compatible overload without profiling buffer
 template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1, int CV_FIFO_SIZE,
           bool INTERMEDIATE_CHECK, bool CAUSAL_MASK, int CV_FIFO_CONS_SYNC_PERIOD>
-void LaunchTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uint16_t *ffts, aclFloat16 *q, aclFloat16 *k,
+void LaunchTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uint32_t batch, uint32_t num_q_heads,
+               uint32_t num_kv_heads, int64_t q_batch_stride, int64_t q_head_stride, int64_t q_seq_stride,
+               int64_t kv_batch_stride, int64_t kv_head_stride, int64_t kv_seq_stride, uint16_t *ffts, aclFloat16 *q,
+               aclFloat16 *k,
                aclFloat16 *v, aclFloat16 *p_tile_fifo, float *exp_max_ififo, float *global_sum_out, float *exp_max_out,
                float *o_out, float *o_parts_out, float *qk_tile_fifo, float *pv_tile_fifo, aclrtStream stream,
                uint8_t *cv_comm_buf)
 {
     LaunchTFA<HEAD_SIZE, CUBE_S0, CUBE_S1, TILE_S1, CV_FIFO_SIZE, INTERMEDIATE_CHECK, CAUSAL_MASK,
-              CV_FIFO_CONS_SYNC_PERIOD>(S0, S1, qk_preload, ffts, q, k, v, p_tile_fifo, exp_max_ififo, global_sum_out,
-                                        exp_max_out, o_out, o_parts_out, qk_tile_fifo, pv_tile_fifo, nullptr, stream,
-                                        cv_comm_buf);
+              CV_FIFO_CONS_SYNC_PERIOD>(S0, S1, qk_preload, batch, num_q_heads, num_kv_heads, q_batch_stride,
+                                        q_head_stride, q_seq_stride, kv_batch_stride, kv_head_stride, kv_seq_stride,
+                                        ffts, q, k, v, p_tile_fifo, exp_max_ififo, global_sum_out, exp_max_out, o_out,
+                                        o_parts_out, qk_tile_fifo, pv_tile_fifo, nullptr, stream, cv_comm_buf);
 }
 
 // No generated_cases.h: the torch PoC drives one fixed shape, instantiated explicitly below.
 
 // S0/S1 are runtime kernel args now, so one instantiation covers every shape that shares
 // the compile-time tiling below. The uint32_t S0, S1 lead the runtime arg list.
+// Common runtime arg list shared by all four instantiations (batch/GQA counts + BNSD/BSND strides
+// lead, right after qk_preload, matching the LaunchTFA signature).
+#define TFA_RUNTIME_ARGS                                                                                         \
+    uint32_t S0, uint32_t S1, uint32_t qk_preload, uint32_t batch, uint32_t num_q_heads, uint32_t num_kv_heads,   \
+        int64_t q_batch_stride, int64_t q_head_stride, int64_t q_seq_stride, int64_t kv_batch_stride,             \
+        int64_t kv_head_stride, int64_t kv_seq_stride, uint16_t *ffts, aclFloat16 *q, aclFloat16 *k,              \
+        aclFloat16 *v, aclFloat16 *p_out, float *p_out_fp32, float *global_sum_out, float *exp_max_out,           \
+        float *o_out, float *o_parts_out, float *qk_out, float *pv_out
+
 #define INSTANTIATE_TFA(HEAD, CUBE_S0, CUBE_S1, TILE_S1, CAUSAL_MASK)                                            \
     template void LaunchTFA<HEAD, CUBE_S0, CUBE_S1, TILE_S1, kFaCvFifoSize, false, CAUSAL_MASK,                  \
                             kFaCvFifoConsSyncPeriod>(                                                             \
-        uint32_t S0, uint32_t S1, uint32_t qk_preload, uint16_t * ffts, aclFloat16 * q, aclFloat16 * k,          \
-        aclFloat16 * v, aclFloat16 * p_out, float *p_out_fp32, float *global_sum_out, float *exp_max_out,        \
-        float *o_out, float *o_parts_out, float *qk_out, float *pv_out, uint8_t *profile_data, aclrtStream stream,\
-        uint8_t *cv_comm_buf);                                                                                    \
+        TFA_RUNTIME_ARGS, uint8_t *profile_data, aclrtStream stream, uint8_t *cv_comm_buf);                       \
     template void LaunchTFA<HEAD, CUBE_S0, CUBE_S1, TILE_S1, kFaCvFifoSize, false, CAUSAL_MASK,                  \
                             kFaCvFifoConsSyncPeriod>(                                                             \
-        uint32_t S0, uint32_t S1, uint32_t qk_preload, uint16_t * ffts, aclFloat16 * q, aclFloat16 * k,          \
-        aclFloat16 * v, aclFloat16 * p_out, float *p_out_fp32, float *global_sum_out, float *exp_max_out,        \
-        float *o_out, float *o_parts_out, float *qk_out, float *pv_out, aclrtStream stream, uint8_t *cv_comm_buf);\
+        TFA_RUNTIME_ARGS, aclrtStream stream, uint8_t *cv_comm_buf);                                              \
     template void LaunchTFA<HEAD, CUBE_S0, CUBE_S1, TILE_S1, kFaCvFifoSize, true, CAUSAL_MASK,                   \
                             kFaCvFifoConsSyncPeriod>(                                                             \
-        uint32_t S0, uint32_t S1, uint32_t qk_preload, uint16_t * ffts, aclFloat16 * q, aclFloat16 * k,          \
-        aclFloat16 * v, aclFloat16 * p_out, float *p_out_fp32, float *global_sum_out, float *exp_max_out,        \
-        float *o_out, float *o_parts_out, float *qk_out, float *pv_out, uint8_t *profile_data, aclrtStream stream,\
-        uint8_t *cv_comm_buf);                                                                                    \
+        TFA_RUNTIME_ARGS, uint8_t *profile_data, aclrtStream stream, uint8_t *cv_comm_buf);                       \
     template void LaunchTFA<HEAD, CUBE_S0, CUBE_S1, TILE_S1, kFaCvFifoSize, true, CAUSAL_MASK,                   \
                             kFaCvFifoConsSyncPeriod>(                                                             \
-        uint32_t S0, uint32_t S1, uint32_t qk_preload, uint16_t * ffts, aclFloat16 * q, aclFloat16 * k,          \
-        aclFloat16 * v, aclFloat16 * p_out, float *p_out_fp32, float *global_sum_out, float *exp_max_out,        \
-        float *o_out, float *o_parts_out, float *qk_out, float *pv_out, aclrtStream stream, uint8_t *cv_comm_buf);
+        TFA_RUNTIME_ARGS, aclrtStream stream, uint8_t *cv_comm_buf);
 
 // Single compile-time tiling for the torch PoC: must match LaunchTFA<...> in tfa_torch_launch.cpp.
 // (HEAD, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, CAUSAL_MASK)  — S0/S1 are chosen at runtime.
@@ -1099,4 +1144,5 @@ INSTANTIATE_TFA(128, 128, 128, kFaTileS1, false)
 INSTANTIATE_TFA(128, 128, 128, kFaTileS1, true)
 
 #undef INSTANTIATE_TFA
+#undef TFA_RUNTIME_ARGS
 #endif // __COSTMODEL

@@ -10,7 +10,7 @@ if [[ -z "${ASCEND_HOME_PATH:-}" ]]; then
     exit 1
 fi
 
-# Build one .so per TILE_S1 variant into its own dir (build/ = 256, build_tile512/ = 512).
+# Build one .so per TILE_S1 variant into its own dir (build/ = 256, build_tile<N>/ = N).
 build_one() {
     local tile=$1 dir=$2
     rm -rf "$dir"
@@ -21,3 +21,4 @@ build_one() {
 
 build_one 256 build
 build_one 512 build_tile512
+build_one 1024 build_tile1024

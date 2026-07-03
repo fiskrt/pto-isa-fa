@@ -27,10 +27,11 @@ class TfaKernel:
         lib.tfa_qk_preload_range.restype = None
         lib.tfa_qk_preload_range.argtypes = [ctypes.POINTER(ctypes.c_int)] * 2
         lib.tfa_workspace_size.restype = ctypes.c_size_t
-        lib.tfa_workspace_size.argtypes = [ctypes.c_int, ctypes.c_int]
+        # s0, s1, batch, num_q_heads
+        lib.tfa_workspace_size.argtypes = [ctypes.c_int] * 4
         lib.tfa_run.restype = ctypes.c_int
-        # q,k,v,o,ws,stream (6 ptrs) + s0, s1, causal, qk_preload
-        lib.tfa_run.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        # q,k,v,o,ws,stream (6 ptrs) + s0, s1, batch, num_q_heads, num_kv_heads, causal, qk_preload
+        lib.tfa_run.argtypes = [ctypes.c_void_p] * 6 + [ctypes.c_int] * 7
 
     @property
     def config(self):
@@ -54,15 +55,18 @@ class TfaKernel:
         if s1 <= 0 or s1 % s1m:
             raise ValueError(f"S1={s1} must be a positive multiple of {s1m}")
 
-    def workspace_size(self, s0, s1):
-        """Bytes to allocate for the workspace block for this shape."""
-        return int(self._lib.tfa_workspace_size(s0, s1))
+    def workspace_size(self, s0, s1, batch=1, num_q_heads=1):
+        """Bytes to allocate for the workspace block for this shape (scales with batch*num_q_heads)."""
+        return int(self._lib.tfa_workspace_size(s0, s1, batch, num_q_heads))
 
-    def run(self, q_ptr, k_ptr, v_ptr, o_ptr, ws_ptr, stream, s0, s1, causal=False, qk_preload=0):
+    def run(self, q_ptr, k_ptr, v_ptr, o_ptr, ws_ptr, stream, s0, s1, batch=1, num_q_heads=1, num_kv_heads=1,
+            causal=False, qk_preload=0):
         """Enqueue the kernel on `stream`. Pointers are raw device addresses (ints from data_ptr()).
 
-        `causal` selects the lower-triangular masked variant. `qk_preload` is the pipeline warmup
-        depth (0 = build default; valid range from qk_preload_range). Returns the launcher's rc
-        (0 on enqueue when a caller stream is given).
+        Q/O are BNSD [batch, num_q_heads, s0, HEAD]; K/V are BNSD [batch, num_kv_heads, s1, HEAD].
+        num_kv_heads must divide num_q_heads (GQA). `causal` selects the lower-triangular masked
+        variant. `qk_preload` is the pipeline warmup depth (0 = build default; valid range from
+        qk_preload_range). Returns the launcher's rc (0 on enqueue when a caller stream is given).
         """
-        return self._lib.tfa_run(q_ptr, k_ptr, v_ptr, o_ptr, ws_ptr, stream, s0, s1, int(causal), int(qk_preload))
+        return self._lib.tfa_run(q_ptr, k_ptr, v_ptr, o_ptr, ws_ptr, stream, s0, s1, int(batch), int(num_q_heads),
+                                 int(num_kv_heads), int(causal), int(qk_preload))

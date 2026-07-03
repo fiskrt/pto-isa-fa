@@ -8,11 +8,14 @@
  * qk_preload are chosen at runtime by the caller, so a single instantiated kernel serves arbitrary
  * shapes as long as S0 % CUBE_S0 == 0 and S1 % TILE_S1 == 0.
  *
- * Expected tensor layouts (row-major, matching the kernel):
- *   q : [S0, HEAD]  float16
- *   k : [HEAD, S1]  float16   (i.e. K transposed: k[h, j] == K[j, h])
- *   v : [S1, HEAD]  float16
- *   o : [S0, HEAD]  float32   (output)
+ * Expected tensor layouts (BNSD, row-major, matching the kernel):
+ *   q : [B, Nq,  S0, HEAD]  float16
+ *   k : [B, Nkv, S1, HEAD]  float16   (native BNSD; the kernel reads it transposed for Q@K^T)
+ *   v : [B, Nkv, S1, HEAD]  float16
+ *   o : [B, Nq,  S0, HEAD]  float32   (output)
+ * GQA: Nkv must divide Nq; query head h uses kv head h / (Nq / Nkv). B == Nq == Nkv == 1 reproduces
+ * the original single-problem case. Layout is passed to the kernel purely as element strides (see
+ * tfa_run), so switching to BSND later only changes the stride computation here.
  */
 
 #include <acl/acl.h>
@@ -60,15 +63,17 @@ struct Sizes {
     static constexpr size_t kCount = 6;
 };
 
-Sizes compute_sizes(int s0, int /*s1*/)
+Sizes compute_sizes(int s0, int /*s1*/, int batch, int num_q_heads)
 {
     const size_t block_rows = static_cast<size_t>(s0) / CUBE_S0;
     // Scratch is per launched core, not per logical row-block: the kernel launches
-    // min(block_rows, kFaMaxCores) cores and each reuses its own FIFO/scratch slot across the
-    // row-blocks assigned to it, so the workspace scales with the core count and no longer grows with
-    // S0 once S0/CUBE_S0 exceeds kFaMaxCores.
+    // min(total_row_blocks, kFaMaxCores) cores and each reuses its own FIFO/scratch slot across the
+    // work items assigned to it, so the workspace scales with the core count. total_row_blocks now
+    // spans the whole (batch x q_head x row-block) grid.
+    const size_t total_row_blocks =
+        static_cast<size_t>(batch) * static_cast<size_t>(num_q_heads) * block_rows;
     const size_t n_cores =
-        block_rows < static_cast<size_t>(kFaMaxCores) ? block_rows : static_cast<size_t>(kFaMaxCores);
+        total_row_blocks < static_cast<size_t>(kFaMaxCores) ? total_row_blocks : static_cast<size_t>(kFaMaxCores);
 
     Sizes sz{};
     sz.bytes[0] = qk_fifo_stride * n_cores * sizeof(aclFloat16); // p_tile_fifo (half)
@@ -90,9 +95,9 @@ struct Scratch {
 };
 
 // Total bytes the workspace must hold for this shape, assuming a 512-byte-aligned base.
-size_t workspace_bytes(int s0, int s1)
+size_t workspace_bytes(int s0, int s1, int batch, int num_q_heads)
 {
-    const Sizes sz = compute_sizes(s0, s1);
+    const Sizes sz = compute_sizes(s0, s1, batch, num_q_heads);
     size_t off = 0;
     for (size_t i = 0; i < Sizes::kCount; ++i) {
         off = align_up(off);
@@ -103,9 +108,9 @@ size_t workspace_bytes(int s0, int s1)
 
 // Slice the sub-buffers out of `base` at the same offsets workspace_bytes() accounts for.
 // `base` must be 512-byte aligned (torch NPU allocations are). Keep this in sync with Scratch.
-void carve_workspace(void *base, int s0, int s1, Scratch &out)
+void carve_workspace(void *base, int s0, int s1, int batch, int num_q_heads, Scratch &out)
 {
-    const Sizes sz = compute_sizes(s0, s1);
+    const Sizes sz = compute_sizes(s0, s1, batch, num_q_heads);
     void **dst[Sizes::kCount] = {
         &out.p_tile_fifo, &out.exp_max_ififo, &out.qk_tile_fifo, &out.pv_tile_fifo, &out.profile, &out.cv_comm,
     };
@@ -138,10 +143,11 @@ void tfa_config(int *head, int *s0_multiple, int *s1_multiple)
     }
 }
 
-// Bytes the caller must allocate for the workspace passed to tfa_run(), for a given shape.
-size_t tfa_workspace_size(int s0, int s1)
+// Bytes the caller must allocate for the workspace passed to tfa_run(), for a given shape. The
+// workspace scales with the launched core count, which now depends on batch * num_q_heads too.
+size_t tfa_workspace_size(int s0, int s1, int batch, int num_q_heads)
 {
-    return workspace_bytes(s0, s1);
+    return workspace_bytes(s0, s1, batch, num_q_heads);
 }
 
 // Valid qk_preload range for tfa_run(): [min, max]. min is 1 when tile_factor==1 else 2; max is the
@@ -165,8 +171,8 @@ void tfa_qk_preload_range(int *min_preload, int *max_preload)
 // current stream), the kernel is only *enqueued* — the caller owns ordering/synchronization/timing —
 // so tfa_run returns 0 without blocking. This keeps the launch async, which is required for correct
 // benchmarking via torch events (do_bench).
-int tfa_run(void *q, void *k, void *v, void *o, void *workspace, void *stream_handle, int s0, int s1, int causal,
-            int qk_preload)
+int tfa_run(void *q, void *k, void *v, void *o, void *workspace, void *stream_handle, int s0, int s1, int batch,
+            int num_q_heads, int num_kv_heads, int causal, int qk_preload)
 {
     if (workspace == nullptr) {
         fprintf(stderr, "[tfa] workspace pointer is null\n");
@@ -175,6 +181,11 @@ int tfa_run(void *q, void *k, void *v, void *o, void *workspace, void *stream_ha
     if (s0 <= 0 || s1 <= 0 || (s0 % CUBE_S0) != 0 || (s1 % TILE_S1) != 0) {
         fprintf(stderr, "[tfa] invalid shape S0=%d S1=%d (need S0%%%d==0, S1%%%d==0)\n", s0, s1, CUBE_S0, TILE_S1);
         return -3;
+    }
+    if (batch <= 0 || num_q_heads <= 0 || num_kv_heads <= 0 || (num_q_heads % num_kv_heads) != 0) {
+        fprintf(stderr, "[tfa] invalid batch/heads B=%d Nq=%d Nkv=%d (need >0 and Nkv | Nq)\n", batch, num_q_heads,
+                num_kv_heads);
+        return -5;
     }
     // qk_preload <= 0 means "use the build default". Runtime warmup depth must fit the FIFO
     // (1..kFaCvFifoSize) and be > 1 unless tile_factor == 1 (see runTFA / fa_performance_kernel.h).
@@ -187,7 +198,17 @@ int tfa_run(void *q, void *k, void *v, void *o, void *workspace, void *stream_ha
         return -4;
     }
     Scratch scratch;
-    carve_workspace(workspace, s0, s1, scratch);
+    carve_workspace(workspace, s0, s1, batch, num_q_heads, scratch);
+
+    // BNSD element strides. This is the ONE place layout is encoded: BSND would set
+    // q_seq_stride = num_q_heads * HEAD_SIZE, q_head_stride = HEAD_SIZE, etc. The head dim is always
+    // contiguous (stride 1). Q and O share the q-side strides; K and V share the kv-side strides.
+    const int64_t q_seq_stride = HEAD_SIZE;
+    const int64_t q_head_stride = static_cast<int64_t>(s0) * HEAD_SIZE;
+    const int64_t q_batch_stride = static_cast<int64_t>(num_q_heads) * s0 * HEAD_SIZE;
+    const int64_t kv_seq_stride = HEAD_SIZE;
+    const int64_t kv_head_stride = static_cast<int64_t>(s1) * HEAD_SIZE;
+    const int64_t kv_batch_stride = static_cast<int64_t>(num_kv_heads) * s1 * HEAD_SIZE;
 
     uint64_t ffts = 0;
     uint32_t ffts_len = 0;
@@ -210,6 +231,8 @@ int tfa_run(void *q, void *k, void *v, void *o, void *workspace, void *stream_ha
         LaunchTFA<HEAD_SIZE, CUBE_S0, CUBE_S1, TILE_S1, kFaCvFifoSize, false, CAUSAL,
                   kFaCvFifoConsSyncPeriod>(
             static_cast<uint32_t>(s0), static_cast<uint32_t>(s1), static_cast<uint32_t>(qk_preload),
+            static_cast<uint32_t>(batch), static_cast<uint32_t>(num_q_heads), static_cast<uint32_t>(num_kv_heads),
+            q_batch_stride, q_head_stride, q_seq_stride, kv_batch_stride, kv_head_stride, kv_seq_stride,
             reinterpret_cast<uint16_t *>(ffts),
             reinterpret_cast<aclFloat16 *>(q), reinterpret_cast<aclFloat16 *>(k), reinterpret_cast<aclFloat16 *>(v),
             reinterpret_cast<aclFloat16 *>(scratch.p_tile_fifo), reinterpret_cast<float *>(scratch.exp_max_ififo),
