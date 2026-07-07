@@ -36,6 +36,18 @@ CAUSAL_ATOL = 9e-3
 
 # Square shapes swept by the CSV mode: S0 == S1 == 1k, 2k, ..., 32k.
 SWEEP_SIZES = [1024, 2048, 4096, 8192, 16384, 32768, ]#64*1024, 128*1024]
+# (batch, num_q_heads, num_kv_heads) triples swept by the CSV mode; num_kv_heads must divide
+# num_q_heads (GQA). The full sweep is this list x SWEEP_SIZES x {causal, non-causal}.
+HEAD_CONFIGS = [
+    (1, 1, 1),
+    (1, 8, 8),
+    (1, 8, 1),
+    (16, 8, 1),
+    (1, 16, 16),
+    (1, 32, 8),
+    (1, 32, 16),
+    (1, 32, 32),
+]
 CSV_FIELDS = ["batch", "nq", "nkv", "S0", "S1", "causal", "impl", "tflops", "ms"]
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -48,15 +60,15 @@ LIB1024 = os.path.join(HERE, "build_tile1024", "lib", "libtfa_torch_tile1024.so"
 # so sweeping preload needs no rebuild. Missing .so files are skipped. Valid qk_preload per build
 # is TfaKernel.qk_preload_range (currently 2..8).
 VARIANTS = {
-    "t256_p2": (LIB256, 2),
-    "t256_p4": (LIB256, 4),
-    "t256_p8": (LIB256, 8),
-    "t512_p2": (LIB512, 2),
+    # "t256_p2": (LIB256, 2),
+    # "t256_p4": (LIB256, 4),
+    # "t256_p8": (LIB256, 8),
+    # "t512_p2": (LIB512, 2),
     "t512_p4": (LIB512, 4),
-    "t512_p8": (LIB512, 8),
-    "t1024_p2": (LIB1024, 2),
-    "t1024_p4": (LIB1024, 4),
-    "t1024_p8": (LIB1024, 8),
+    # "t512_p8": (LIB512, 8),
+    # "t1024_p2": (LIB1024, 2),
+    # "t1024_p4": (LIB1024, 4),
+    # "t1024_p8": (LIB1024, 8),
 }
 
 
@@ -168,22 +180,24 @@ def benchmark_one(variants, S0, S1, causal, batch=1, num_q_heads=1, num_kv_heads
     return results
 
 
-def generate_csv(variants, path, batch, num_q_heads, num_kv_heads, sizes=SWEEP_SIZES):
-    """Sweep sizes x {causal, non-causal} for a fixed (batch, Nq, Nkv), one row per (shape, causal, impl).
+def generate_csv(variants, path, configs=HEAD_CONFIGS, sizes=SWEEP_SIZES):
+    """Sweep configs x sizes x {causal, non-causal}, one row per (config, shape, causal, impl).
 
-    The batch/head config is recorded in every row so the CSV (and the plot it feeds) is
-    self-describing rather than implicitly assuming B=Nq=Nkv=1.
+    `configs` is a list of (batch, Nq, Nkv) triples (Nkv must divide Nq; GQA). The batch/head
+    config is recorded in every row so the CSV (and the plot it feeds) is self-describing rather
+    than implicitly assuming B=Nq=Nkv=1.
     """
     rows = []
-    for S in sizes:
-        for causal in (False, True):
-            print(f"\n=== B={batch} Nq={num_q_heads} Nkv={num_kv_heads} S0=S1={S} causal={causal} ===")
-            res = benchmark_one(variants, S, S, causal,
-                                batch=batch, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads)
-            for label, r in res.items():
-                rows.append({"batch": batch, "nq": num_q_heads, "nkv": num_kv_heads,
-                             "S0": S, "S1": S, "causal": causal, "impl": label,
-                             "tflops": r["tflops"], "ms": r["ms"]})
+    for batch, num_q_heads, num_kv_heads in configs:
+        for S in sizes:
+            for causal in (False, True):
+                print(f"\n=== B={batch} Nq={num_q_heads} Nkv={num_kv_heads} S0=S1={S} causal={causal} ===")
+                res = benchmark_one(variants, S, S, causal,
+                                    batch=batch, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads)
+                for label, r in res.items():
+                    rows.append({"batch": batch, "nq": num_q_heads, "nkv": num_kv_heads,
+                                 "S0": S, "S1": S, "causal": causal, "impl": label,
+                                 "tflops": r["tflops"], "ms": r["ms"]})
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         w.writeheader()
@@ -194,49 +208,51 @@ def generate_csv(variants, path, batch, num_q_heads, num_kv_heads, sizes=SWEEP_S
 def plot_csv(csv_path, out_path):
     """Plot a grid colored by <variant>/torch_npu TFLOP/s (green = ours faster, red = slower).
 
-    One row per (ours variant, causal); one column per size. Every impl in the CSV except
-    torch_npu is treated as an ours-variant, so adding tile sizes just adds rows automatically.
+    One row per (config, ours variant, causal); one column per size, where config is the
+    (B, Nq, Nkv) triple. Every impl in the CSV except torch_npu is treated as an ours-variant,
+    so adding tile sizes or head configs just adds rows automatically.
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.colors import TwoSlopeNorm
 
-    # data[(causal, S)] = {impl: tflops}
+    # data[(cfg, causal, S)] = {impl: tflops}; cfg = (batch, nq, nkv) as strings, .get keeps
+    # old configless CSVs working.
     data = {}
-    cfg = None  # (batch, nq, nkv) from the CSV; .get keeps old configless CSVs working
     with open(csv_path) as f:
         for row in csv.DictReader(f):
-            key = (row["causal"] == "True", int(row["S0"]))
+            cfg = (row.get("batch", "1"), row.get("nq", "1"), row.get("nkv", "1"))
+            key = (cfg, row["causal"] == "True", int(row["S0"]))
             data.setdefault(key, {})[row["impl"]] = float(row["tflops"])
-            if cfg is None:
-                cfg = (row.get("batch", "1"), row.get("nq", "1"), row.get("nkv", "1"))
 
-    sizes = sorted({S for _, S in data})
+    sizes = sorted({S for _, _, S in data})
+    cfgs = sorted({cfg for cfg, _, _ in data})
     variants = sorted({impl for d in data.values() for impl in d} - {"torch_npu"})
-    # Rows = every (variant, causal) pair; each colored by that variant's speedup vs torch_npu.
-    rows = [(v, c) for v in variants for c in (False, True)]
-    ratio = [[data[(c, S)][v] / data[(c, S)]["torch_npu"] for S in sizes] for v, c in rows]
+    # Rows = every (config, variant, causal) triple; each colored by that variant's speedup.
+    rows = [(cfg, v, c) for cfg in cfgs for v in variants for c in (False, True)]
+    ratio = [[data[(cfg, c, S)][v] / data[(cfg, c, S)]["torch_npu"] for S in sizes]
+             for cfg, v, c in rows]
 
-    fig, ax = plt.subplots(figsize=(1.5 * len(sizes) + 1.5, 0.9 * len(rows) + 1))
-    lo = min(min(r) for r in ratio)
-    hi = max(max(r) for r in ratio)
+    fig, ax = plt.subplots(figsize=(1.5 * len(sizes) + 2.0, 0.9 * len(rows) + 1))
+    lo = 0.8 #min(min(r) for r in ratio)
+    hi = 1.1 # max(max(r) for r in ratio)
     norm = TwoSlopeNorm(vmin=min(lo, 0.99), vcenter=1.0, vmax=max(hi, 1.01))
     ax.imshow(ratio, cmap="RdYlGn", norm=norm, aspect="auto")
 
     ax.set_xticks(range(len(sizes)))
     ax.set_xticklabels([f"{S // 1024}k" for S in sizes])
     ax.set_yticks(range(len(rows)))
-    ax.set_yticklabels([f"{v}\ncausal={c}" for v, c in rows])
+    ax.set_yticklabels([f"B{cfg[0]} Nq{cfg[1]} Nkv{cfg[2]}\n{v} causal={c}" for cfg, v, c in rows])
     ax.set_xlabel("S0 = S1")
 
-    for i, (v, c) in enumerate(rows):
+    for i, (cfg, v, c) in enumerate(rows):
         for j, S in enumerate(sizes):
-            d = data[(c, S)]
+            d = data[(cfg, c, S)]
             ax.text(j, i, f"{ratio[i][j]:.2f}x\n{d[v]:.0f} vs {d['torch_npu']:.0f}\nTFLOP/s",
                     ha="center", va="center", fontsize=8)
 
-    ax.set_title(f"Speedup ours / torch_npu  (B={cfg[0]} Nq={cfg[1]} Nkv={cfg[2]}; green = ours faster)")
+    ax.set_title("Speedup ours / torch_npu  (green = ours faster)")
     fig.tight_layout()
     fig.savefig(out_path, dpi=150)
     print(f"[plot] wrote {out_path}")
@@ -264,7 +280,7 @@ def main():
         raise FileNotFoundError(f"no kernel .so found; build first (bash build.sh). VARIANTS: {VARIANTS}")
 
     if args.csv:
-        generate_csv(variants, args.csv, args.batch, args.nq, args.nkv)
+        generate_csv(variants, args.csv)  # sweeps HEAD_CONFIGS defined at the top
         plot_csv(args.csv, args.out)  # auto-plot the sweep we just wrote
         return
 
