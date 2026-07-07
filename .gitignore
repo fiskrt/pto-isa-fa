@@ -1,4 +1,9 @@
 refs/
 build/
+build_tile512/
+build_tile1024/
+
+*.csv
+*.png
 
 *.pyc
