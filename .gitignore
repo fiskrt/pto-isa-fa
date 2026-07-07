@@ -9,3 +9,5 @@ log/
 .vscode/
 msprof_res/
 oldv/
+.claude/
+*.png
