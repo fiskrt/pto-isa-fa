@@ -628,7 +628,7 @@ AICORE inline void compute_gu(PVPipe &pvPipe, int tile_id, int num_tiles, __gm__
 
 template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1, int CV_FIFO_SIZE,
           bool INTERMEDIATE_CHECK, bool CAUSAL_MASK, int CV_FIFO_CONS_SYNC_PERIOD>
-__global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uint32_t batch, uint32_t num_q_heads,
+AICORE inline void runTFAImpl(uint32_t S0, uint32_t S1, uint32_t qk_preload, uint32_t batch, uint32_t num_q_heads,
                               uint32_t num_kv_heads, int64_t q_batch_stride, int64_t q_head_stride,
                               int64_t q_seq_stride, int64_t kv_batch_stride, int64_t kv_head_stride,
                               int64_t kv_seq_stride, __gm__ uint64_t *ffts_addr, __gm__ half *q,
@@ -1115,9 +1115,38 @@ __global__ AICORE void runTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uin
 #endif
 }
 
-// // Empty kernel to warm up cores
-// __global__ AICORE __attribute__((aic)) void warmup_kernel()
-// {}
+// extern "C" kernel entry points. runTFAImpl above is a templated device function; launching a
+// __global__ template makes it show up in profilers (msprof) under its mangled name
+// (_Z6runTFAILi128E...). These C-linkage wrappers give the two launched kernels readable symbols.
+// Tiling is fixed for this build; INTERMEDIATE_CHECK stays false (flip it here to dump per-tile
+// exp_max for precision debugging), so only the causal / non-causal split needs its own kernel.
+extern "C" __global__ AICORE void tfa_kernel(
+    uint32_t S0, uint32_t S1, uint32_t qk_preload, uint32_t batch, uint32_t num_q_heads, uint32_t num_kv_heads,
+    int64_t q_batch_stride, int64_t q_head_stride, int64_t q_seq_stride, int64_t kv_batch_stride,
+    int64_t kv_head_stride, int64_t kv_seq_stride, __gm__ uint64_t *ffts_addr, __gm__ half *q, __gm__ half *k,
+    __gm__ half *v, __gm__ half *p_tile_fifo, __gm__ float *exp_max_ififo, __gm__ float *global_sum_out,
+    __gm__ float *exp_max_out, __gm__ float *o_out, __gm__ float *o_parts_out, __gm__ float *qk_tile_fifo,
+    __gm__ float *pv_tile_fifo, __gm__ uint8_t *cv_comm_buf, __gm__ uint8_t *profile_buf)
+{
+    runTFAImpl<128, 128, kFaCubeS1, kFaTileS1, kFaCvFifoSize, false, false, kFaCvFifoConsSyncPeriod>(
+        S0, S1, qk_preload, batch, num_q_heads, num_kv_heads, q_batch_stride, q_head_stride, q_seq_stride,
+        kv_batch_stride, kv_head_stride, kv_seq_stride, ffts_addr, q, k, v, p_tile_fifo, exp_max_ififo,
+        global_sum_out, exp_max_out, o_out, o_parts_out, qk_tile_fifo, pv_tile_fifo, cv_comm_buf, profile_buf);
+}
+
+extern "C" __global__ AICORE void tfa_kernel_causal(
+    uint32_t S0, uint32_t S1, uint32_t qk_preload, uint32_t batch, uint32_t num_q_heads, uint32_t num_kv_heads,
+    int64_t q_batch_stride, int64_t q_head_stride, int64_t q_seq_stride, int64_t kv_batch_stride,
+    int64_t kv_head_stride, int64_t kv_seq_stride, __gm__ uint64_t *ffts_addr, __gm__ half *q, __gm__ half *k,
+    __gm__ half *v, __gm__ half *p_tile_fifo, __gm__ float *exp_max_ififo, __gm__ float *global_sum_out,
+    __gm__ float *exp_max_out, __gm__ float *o_out, __gm__ float *o_parts_out, __gm__ float *qk_tile_fifo,
+    __gm__ float *pv_tile_fifo, __gm__ uint8_t *cv_comm_buf, __gm__ uint8_t *profile_buf)
+{
+    runTFAImpl<128, 128, kFaCubeS1, kFaTileS1, kFaCvFifoSize, false, true, kFaCvFifoConsSyncPeriod>(
+        S0, S1, qk_preload, batch, num_q_heads, num_kv_heads, q_batch_stride, q_head_stride, q_seq_stride,
+        kv_batch_stride, kv_head_stride, kv_seq_stride, ffts_addr, q, k, v, p_tile_fifo, exp_max_ififo,
+        global_sum_out, exp_max_out, o_out, o_parts_out, qk_tile_fifo, pv_tile_fifo, cv_comm_buf, profile_buf);
+}
 
 // Host wrapper (NPU launch — skipped under costmodel)
 #ifndef __COSTMODEL
@@ -1140,85 +1169,37 @@ void LaunchTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uint32_t batch, ui
                                  total_row_blocks :
                                  static_cast<uint32_t>(kFaMaxCores);
 
-// #if defined(__DAV_C220_CUBE__) || defined(__DAV_C220_VEC__)
-//     // Warm up all cores first, then prefetch q/k/v into L2
-//     warmup_kernel<<<24, nullptr, stream>>>();
+    // The extern "C" tfa_kernel* wrappers hardcode the tiling below (so their launched symbols get
+    // readable names); guard against ever instantiating LaunchTFA for a tiling they don't cover.
+    // INTERMEDIATE_CHECK has no wrapper — to dump per-tile exp_max for precision debugging, flip the
+    // template arg in tfa_kernel/tfa_kernel_causal to true and rebuild.
+    static_assert(HEAD_SIZE == 128 && CUBE_S0 == 128 && CUBE_S1 == kFaCubeS1 && TILE_S1 == kFaTileS1 &&
+                      CV_FIFO_SIZE == kFaCvFifoSize && CV_FIFO_CONS_SYNC_PERIOD == kFaCvFifoConsSyncPeriod &&
+                      !INTERMEDIATE_CHECK,
+                  "extern-C tfa_kernel* wrappers hardcode this tiling with INTERMEDIATE_CHECK=false");
 
-    // const uint64_t tensor_elems = static_cast<uint64_t>(S0) * static_cast<uint64_t>(HEAD_SIZE);
-    // const uint64_t tensor_bytes = tensor_elems * sizeof(half);
-    // constexpr bool kPrefetchUseSdma = true; // simulation cannot use sdma
-    // constexpr int kPrefetchAivCores = 40;   // only used when kPrefetchUseSdma is false
-
-    // if constexpr (kPrefetchUseSdma) {
-    //     PTO_PREFETCH((__gm__ void *)q, tensor_bytes, stream);
-    //     PTO_PREFETCH((__gm__ void *)k, tensor_bytes, stream);
-    //     PTO_PREFETCH((__gm__ void *)v, tensor_bytes, stream);
-    // } else {
-    //     PTO_PREFETCH<false, kPrefetchAivCores>((__gm__ void *)q, tensor_bytes, stream);
-    //     PTO_PREFETCH<false, kPrefetchAivCores>((__gm__ void *)k, tensor_bytes, stream);
-    //     PTO_PREFETCH<false, kPrefetchAivCores>((__gm__ void *)v, tensor_bytes, stream);
-    // }
-// #endif
-
-    runTFA<HEAD_SIZE, CUBE_S0, CUBE_S1, TILE_S1, CV_FIFO_SIZE, INTERMEDIATE_CHECK, CAUSAL_MASK,
-           CV_FIFO_CONS_SYNC_PERIOD><<<n_cores, nullptr, stream>>>(
-        S0, S1, qk_preload, batch, num_q_heads, num_kv_heads, q_batch_stride, q_head_stride, q_seq_stride,
-        kv_batch_stride, kv_head_stride, kv_seq_stride, (__gm__ uint64_t *)ffts, (half *)q, (half *)k, (half *)v,
-        (half *)p_tile_fifo, exp_max_ififo, global_sum_out, exp_max_out, o_out, o_parts_out, qk_tile_fifo,
-        pv_tile_fifo, cv_comm_buf, profile_data);
+    if constexpr (CAUSAL_MASK) {
+        tfa_kernel_causal<<<n_cores, nullptr, stream>>>(
+            S0, S1, qk_preload, batch, num_q_heads, num_kv_heads, q_batch_stride, q_head_stride, q_seq_stride,
+            kv_batch_stride, kv_head_stride, kv_seq_stride, (__gm__ uint64_t *)ffts, (half *)q, (half *)k, (half *)v,
+            (half *)p_tile_fifo, exp_max_ififo, global_sum_out, exp_max_out, o_out, o_parts_out, qk_tile_fifo,
+            pv_tile_fifo, cv_comm_buf, profile_data);
+    } else {
+        tfa_kernel<<<n_cores, nullptr, stream>>>(
+            S0, S1, qk_preload, batch, num_q_heads, num_kv_heads, q_batch_stride, q_head_stride, q_seq_stride,
+            kv_batch_stride, kv_head_stride, kv_seq_stride, (__gm__ uint64_t *)ffts, (half *)q, (half *)k, (half *)v,
+            (half *)p_tile_fifo, exp_max_ififo, global_sum_out, exp_max_out, o_out, o_parts_out, qk_tile_fifo,
+            pv_tile_fifo, cv_comm_buf, profile_data);
+    }
 }
 
-// Backward-compatible overload without profiling buffer
-template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1, int CV_FIFO_SIZE,
-          bool INTERMEDIATE_CHECK, bool CAUSAL_MASK, int CV_FIFO_CONS_SYNC_PERIOD>
-void LaunchTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uint32_t batch, uint32_t num_q_heads,
-               uint32_t num_kv_heads, int64_t q_batch_stride, int64_t q_head_stride, int64_t q_seq_stride,
-               int64_t kv_batch_stride, int64_t kv_head_stride, int64_t kv_seq_stride, uint16_t *ffts, aclFloat16 *q,
-               aclFloat16 *k,
-               aclFloat16 *v, aclFloat16 *p_tile_fifo, float *exp_max_ififo, float *global_sum_out, float *exp_max_out,
-               float *o_out, float *o_parts_out, float *qk_tile_fifo, float *pv_tile_fifo, aclrtStream stream,
-               uint8_t *cv_comm_buf)
-{
-    LaunchTFA<HEAD_SIZE, CUBE_S0, CUBE_S1, TILE_S1, CV_FIFO_SIZE, INTERMEDIATE_CHECK, CAUSAL_MASK,
-              CV_FIFO_CONS_SYNC_PERIOD>(S0, S1, qk_preload, batch, num_q_heads, num_kv_heads, q_batch_stride,
-                                        q_head_stride, q_seq_stride, kv_batch_stride, kv_head_stride, kv_seq_stride,
-                                        ffts, q, k, v, p_tile_fifo, exp_max_ififo, global_sum_out, exp_max_out, o_out,
-                                        o_parts_out, qk_tile_fifo, pv_tile_fifo, nullptr, stream, cv_comm_buf);
-}
-
-// No generated_cases.h: the torch PoC drives one fixed shape, instantiated explicitly below.
-
-// S0/S1 are runtime kernel args now, so one instantiation covers every shape that shares
-// the compile-time tiling below. The uint32_t S0, S1 lead the runtime arg list.
-// Common runtime arg list shared by all four instantiations (batch/GQA counts + BNSD/BSND strides
-// lead, right after qk_preload, matching the LaunchTFA signature).
-#define TFA_RUNTIME_ARGS                                                                                         \
-    uint32_t S0, uint32_t S1, uint32_t qk_preload, uint32_t batch, uint32_t num_q_heads, uint32_t num_kv_heads,   \
-        int64_t q_batch_stride, int64_t q_head_stride, int64_t q_seq_stride, int64_t kv_batch_stride,             \
-        int64_t kv_head_stride, int64_t kv_seq_stride, uint16_t *ffts, aclFloat16 *q, aclFloat16 *k,              \
-        aclFloat16 *v, aclFloat16 *p_out, float *p_out_fp32, float *global_sum_out, float *exp_max_out,           \
-        float *o_out, float *o_parts_out, float *qk_out, float *pv_out
-
-#define INSTANTIATE_TFA(HEAD, CUBE_S0, CUBE_S1, TILE_S1, CAUSAL_MASK)                                            \
-    template void LaunchTFA<HEAD, CUBE_S0, CUBE_S1, TILE_S1, kFaCvFifoSize, false, CAUSAL_MASK,                  \
-                            kFaCvFifoConsSyncPeriod>(                                                             \
-        TFA_RUNTIME_ARGS, uint8_t *profile_data, aclrtStream stream, uint8_t *cv_comm_buf);                       \
-    template void LaunchTFA<HEAD, CUBE_S0, CUBE_S1, TILE_S1, kFaCvFifoSize, false, CAUSAL_MASK,                  \
-                            kFaCvFifoConsSyncPeriod>(                                                             \
-        TFA_RUNTIME_ARGS, aclrtStream stream, uint8_t *cv_comm_buf);                                              \
-    template void LaunchTFA<HEAD, CUBE_S0, CUBE_S1, TILE_S1, kFaCvFifoSize, true, CAUSAL_MASK,                   \
-                            kFaCvFifoConsSyncPeriod>(                                                             \
-        TFA_RUNTIME_ARGS, uint8_t *profile_data, aclrtStream stream, uint8_t *cv_comm_buf);                       \
-    template void LaunchTFA<HEAD, CUBE_S0, CUBE_S1, TILE_S1, kFaCvFifoSize, true, CAUSAL_MASK,                   \
-                            kFaCvFifoConsSyncPeriod>(                                                             \
-        TFA_RUNTIME_ARGS, aclrtStream stream, uint8_t *cv_comm_buf);
-
-// Single compile-time tiling for the torch PoC: must match LaunchTFA<...> in tfa_torch_launch.cpp.
-// (HEAD, CUBE_S0, CUBE_S1, TILE_S1, QK_PRELOAD, CAUSAL_MASK)  — S0/S1 are chosen at runtime.
-// Both CAUSAL_MASK variants are instantiated so tfa_run can pick one at runtime.
-INSTANTIATE_TFA(128, 128, 128, kFaTileS1, false)
-INSTANTIATE_TFA(128, 128, 128, kFaTileS1, true)
-
-#undef INSTANTIATE_TFA
-#undef TFA_RUNTIME_ARGS
+// tfa_run picks causal / non-causal at runtime, so instantiate both.
+template void LaunchTFA<128, 128, 128, kFaTileS1, kFaCvFifoSize, false, false, kFaCvFifoConsSyncPeriod>(
+    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+    uint16_t *, aclFloat16 *, aclFloat16 *, aclFloat16 *, aclFloat16 *, float *, float *, float *, float *, float *,
+    float *, float *, uint8_t *, aclrtStream, uint8_t *);
+template void LaunchTFA<128, 128, 128, kFaTileS1, kFaCvFifoSize, false, true, kFaCvFifoConsSyncPeriod>(
+    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+    uint16_t *, aclFloat16 *, aclFloat16 *, aclFloat16 *, aclFloat16 *, float *, float *, float *, float *, float *,
+    float *, float *, uint8_t *, aclrtStream, uint8_t *);
 #endif // __COSTMODEL

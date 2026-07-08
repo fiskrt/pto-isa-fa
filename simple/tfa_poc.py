@@ -80,6 +80,7 @@ def parse_args():
     p.add_argument("--nq", type=int, default=1, help="number of query heads Nq")
     p.add_argument("--nkv", type=int, default=1, help="number of kv heads Nkv (must divide Nq; GQA)")
     p.add_argument("--causal", action="store_true", help="apply lower-triangular causal mask (attend to key j <= query i)")
+    p.add_argument("--profile", action="store_true", help="launch the kernel exactly once for the given shape (no correctness/bench), for use under an external profiler (msprof)")
     p.add_argument("--csv", metavar="PATH", help="sweep SWEEP_SIZES x {causal,non-causal} and write a CSV here")
     p.add_argument("--plot", metavar="CSV_PATH", help="read a CSV written by --csv and plot the speedup grid")
     p.add_argument("--out", metavar="PATH", default="tfa_speedup.png", help="output image path for --plot")
@@ -278,6 +279,28 @@ def main():
         variants[label] = (cache[path], preload)
     if not variants:
         raise FileNotFoundError(f"no kernel .so found; build first (bash build.sh). VARIANTS: {VARIANTS}")
+
+    if args.profile:
+        # Single kernel launch (no correctness check, no timing loop) so an external profiler
+        # (msprof) captures exactly one FA invocation for the requested shape/params.
+        label, (kernel, qk_preload) = next(iter(variants.items()))
+        S0, S1, HEAD = args.s0, args.s1, kernel.config[0]
+        dev = "npu:0"
+        kernel.validate_shape(S0, S1)
+        torch.manual_seed(0)
+        q = (torch.randn(args.batch, args.nq, S0, HEAD, device=dev) * 0.1).to(torch.float16)
+        k = (torch.randn(args.batch, args.nkv, S1, HEAD, device=dev) * 0.1).to(torch.float16)
+        v = (torch.randn(args.batch, args.nkv, S1, HEAD, device=dev) * 0.1).to(torch.float16)
+        k_kernel = k.transpose(2, 3).contiguous()  # DN layout the kernel reads (see benchmark_one)
+        o = torch.zeros(args.batch, args.nq, S0, HEAD, dtype=torch.float32, device=dev)
+        workspace = torch.empty(kernel.workspace_size(S0, S1, args.batch, args.nq), dtype=torch.uint8, device=dev)
+        kernel.run(q.data_ptr(), k_kernel.data_ptr(), v.data_ptr(), o.data_ptr(), workspace.data_ptr(),
+                   torch.npu.current_stream().npu_stream, S0, S1, args.batch, args.nq, args.nkv,
+                   args.causal, qk_preload)
+        torch.npu.synchronize()
+        print(f"[profile] ran {label} once: B={args.batch} Nq={args.nq} Nkv={args.nkv} "
+              f"S0={S0} S1={S1} HEAD={HEAD} causal={args.causal}")
+        return
 
     if args.csv:
         generate_csv(variants, args.csv)  # sweeps HEAD_CONFIGS defined at the top

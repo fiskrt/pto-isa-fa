@@ -52,14 +52,4 @@ void LaunchTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uint32_t batch, ui
                float *exp_max_out, float *o_out, float *o_parts_out, float *qk_tile_fifo, float *pv_tile_fifo,
                uint8_t *profile_data, aclrtStream stream, uint8_t *cv_comm_buf = nullptr);
 
-// Overload without profiling buffer.
-template <int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1, int CV_FIFO_SIZE,
-          bool INTERMEDIATE_CHECK, bool CAUSAL_MASK, int CV_FIFO_CONS_SYNC_PERIOD>
-void LaunchTFA(uint32_t S0, uint32_t S1, uint32_t qk_preload, uint32_t batch, uint32_t num_q_heads,
-               uint32_t num_kv_heads, int64_t q_batch_stride, int64_t q_head_stride, int64_t q_seq_stride,
-               int64_t kv_batch_stride, int64_t kv_head_stride, int64_t kv_seq_stride, uint16_t *ffts, aclFloat16 *q,
-               aclFloat16 *k, aclFloat16 *v, aclFloat16 *p_tile_fifo, float *exp_max_ififo, float *global_sum_out,
-               float *exp_max_out, float *o_out, float *o_parts_out, float *qk_tile_fifo, float *pv_tile_fifo,
-               aclrtStream stream, uint8_t *cv_comm_buf = nullptr);
-
 #endif // FA_PERFORMANCE_KERNEL_H
