@@ -477,7 +477,18 @@ AICORE inline void compute_p(QKPipe &qkPipe, PPipe &pPipe, int tile_id, int row_
         using QKLoadGlobal =
             GlobalTensor<half, pto::Shape<1, 1, 1, Vec_S0, Cube_S1>, pto::Stride<1, 1, 1, Cube_S1, 1>>;
         using TileDataHSub = Tile<TileType::Vec, half, Vec_S0, Tile_S1, BLayout::RowMajor, Vec_S0, Cube_S1>;
+        TileDataH_T triuAsHalf;
+        TASSIGN(triuAsHalf, (uint64_t)triu.data());
         for (int sub_col = 0; sub_col < static_cast<int>(kTileFactor); ++sub_col) {
+            const int sub_s1_index = s1_index + sub_col * static_cast<int>(Cube_S1);
+            if constexpr (CAUSAL_MASK) {
+                // compute_qk skips causal subtiles that are fully above this row block's triangle.
+                // Do not read their unwritten fp16 FIFO bytes; the softmax causal mask overwrites
+                // those lanes before the row reduction sees them.
+                if (sub_s1_index > blk_idx * static_cast<int>(Cube_S0)) {
+                    continue;
+                }
+            }
             QKLoadGlobal qkLoadGlobal(qk_ptr + static_cast<size_t>(sub_col) * static_cast<size_t>(Cube_S0) *
                                                    static_cast<size_t>(Cube_S1));
             TileDataHSub qkHalfSub;
@@ -494,8 +505,6 @@ AICORE inline void compute_p(QKPipe &qkPipe, PPipe &pPipe, int tile_id, int row_
 
         // Widen the staged fp16 scores (in triu) into the fp32 qkVecTile the softmax consumes. The
         // barrier orders this read of triu before the causal mask (softmax) rewrites triu from causal_e.
-        TileDataH_T triuAsHalf;
-        TASSIGN(triuAsHalf, (uint64_t)triu.data());
         TCVT(qkVecTile, triuAsHalf, RoundMode::CAST_ROUND);
         pipe_barrier(PIPE_V);
 
@@ -765,11 +774,8 @@ AICORE inline void runTFAImpl(uint32_t S0, uint32_t S1, uint32_t qk_preload, uin
     // whole kernel — the hot path then just adds a scalar and clamps (no per-diagonal-tile scalar loop).
     if constexpr (DAV_VEC && CAUSAL_MASK) {
         // Build E in fp32 (scalar half ops are illegal on aicore) in the triu scratch, then cast to
-        // fp16 once. triu is free here (only used during the work loop). Row 0 = [0,-1,-2,...] via a
-        // descending fp32 TCI; row i = row 0 + i.
-        // Build E in the qkVecTile[0] scratch (free at startup) rather than triu: compute_p now stages
-        // the fp16 QK scores through triu, so keeping E out of triu removes any coupling with it.
-        const uint64_t e_scratch = (uint64_t)qkVecTile[0].data();
+        // fp16 once. triu is free here because compute_p only uses it later inside the work loop.
+        const uint64_t e_scratch = (uint64_t)triu.data();
         using ERowF = Tile<TileType::Vec, float, 1, Tile_S1, BLayout::RowMajor, 1, Tile_S1>;
         using EBlockF = Tile<TileType::Vec, float, Vec_S0, Tile_S1, BLayout::RowMajor, Vec_S0, Tile_S1>;
         ERowF e_row0;
