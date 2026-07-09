@@ -238,7 +238,7 @@ template <typename QKPipe, int HEAD_SIZE, int CUBE_S0, int CUBE_S1, int TILE_S1,
           int CV_FIFO_CONS_SYNC_PERIOD, bool INTERMEDIATE_CHECK, bool CAUSAL_MASK, typename TileMatQData,
           typename TileMatKData, typename TileQKData, typename QKSlotGlobal>
 AICORE inline void compute_qk(QKPipe &qkPipe, int tile_id, int sub_tile_id, __gm__ half *q, __gm__ half *k,
-                              __gm__ float *qk_tile_fifo, TileMatQData &qMatTile, TileMatKData &kMatTile,
+                              __gm__ half *qk_tile_fifo, TileMatQData &qMatTile, TileMatKData &kMatTile,
                               TileQKData &qkAccTile, QKSlotGlobal &qkSlotGlobal, uint64_t qkMatTileEventId,
                               int accTileEvtID, int blk_idx, int64_t q_seq_stride, int64_t kv_seq_stride)
 {
@@ -302,8 +302,11 @@ AICORE inline void compute_qk(QKPipe &qkPipe, int tile_id, int sub_tile_id, __gm
         wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
 #endif
 
+        // fp16 store: the fixpipe casts the fp32 L0C accumulator to fp16 on write (F322F16), halving the
+        // writeback bytes. Scores are ~O(0.1) with no overflow risk, and this is the only fp16 rounding
+        // before the softmax exp smooths it (P and V are already fp16), so accuracy stays within tol.
         using QKStoreGlobal =
-            GlobalTensor<float, pto::Shape<1, 1, 1, Cube_S0, Cube_S1>, pto::Stride<1, 1, 1, Cube_S1, 1>>;
+            GlobalTensor<half, pto::Shape<1, 1, 1, Cube_S0, Cube_S1>, pto::Stride<1, 1, 1, Cube_S1, 1>>;
         const uint32_t buf_idx = static_cast<uint32_t>(tile_id % QKP_CV_FIFO);
         const size_t base_elems =
             static_cast<size_t>(buf_idx) * static_cast<size_t>(kTileFactor) * static_cast<size_t>(Cube_S0) *
@@ -434,7 +437,7 @@ template <typename QKPipe, typename PPipe, int HEAD_SIZE, int CUBE_S0, int CUBE_
           int CV_FIFO_CONS_SYNC_PERIOD, bool INTERMEDIATE_CHECK, bool CAUSAL_MASK, typename TileDataF_T,
           typename TileDataH_T, typename ReduceTileF_T, typename QKVecSlotGlobal, typename PVecSlotGlobal>
 AICORE inline void compute_p(QKPipe &qkPipe, PPipe &pPipe, int tile_id, int row_slice, __gm__ float *exp_max_ififo,
-                             __gm__ float *qk_tile_fifo, __gm__ half *p_tile_fifo, __gm__ float *global_sum_out,
+                             __gm__ half *qk_tile_fifo, __gm__ half *p_tile_fifo, __gm__ float *global_sum_out,
                              __gm__ float *exp_max_out, TileDataF_T &qkVecTile, TileDataH_T &x_expT,
                              TileDataF_T &input_reduce_tmp, ReduceTileF_T &m1_local_max, ReduceTileF_T &l1_local_sum,
                              ReduceTileF_T &m2_global_max, ReduceTileF_T &l2_global_sum,
@@ -468,17 +471,19 @@ AICORE inline void compute_p(QKPipe &qkPipe, PPipe &pPipe, int tile_id, int row_
         const uint32_t qk_buf_idx = static_cast<uint32_t>(tile_id % QKP_CV_FIFO);
         const size_t qk_base_elems = static_cast<size_t>(qk_buf_idx) * static_cast<size_t>(kTileFactor) *
                                      static_cast<size_t>(Cube_S0) * static_cast<size_t>(Cube_S1);
-        __gm__ float *qk_ptr = qk_tile_fifo + qk_base_elems + row_offset * static_cast<size_t>(Cube_S1);
+        // QK scores now arrive fp16 (see compute_qk). Stage each fp16 sub-column into the `triu` scratch,
+        // then widen fp16->fp32 into qkVecTile with a single TCVT so the softmax still runs in fp32.
+        __gm__ half *qk_ptr = qk_tile_fifo + qk_base_elems + row_offset * static_cast<size_t>(Cube_S1);
         using QKLoadGlobal =
-            GlobalTensor<float, pto::Shape<1, 1, 1, Vec_S0, Cube_S1>, pto::Stride<1, 1, 1, Cube_S1, 1>>;
-        using TileDataFSub = Tile<TileType::Vec, float, Vec_S0, Tile_S1, BLayout::RowMajor, Vec_S0, Cube_S1>;
+            GlobalTensor<half, pto::Shape<1, 1, 1, Vec_S0, Cube_S1>, pto::Stride<1, 1, 1, Cube_S1, 1>>;
+        using TileDataHSub = Tile<TileType::Vec, half, Vec_S0, Tile_S1, BLayout::RowMajor, Vec_S0, Cube_S1>;
         for (int sub_col = 0; sub_col < static_cast<int>(kTileFactor); ++sub_col) {
             QKLoadGlobal qkLoadGlobal(qk_ptr + static_cast<size_t>(sub_col) * static_cast<size_t>(Cube_S0) *
                                                    static_cast<size_t>(Cube_S1));
-            TileDataFSub qkVecSub;
-            TASSIGN(qkVecSub, (uint64_t)qkVecTile.data() +
-                                  static_cast<uint64_t>(sub_col) * static_cast<uint64_t>(Cube_S1) * sizeof(float));
-            TLOAD(qkVecSub, qkLoadGlobal);
+            TileDataHSub qkHalfSub;
+            TASSIGN(qkHalfSub, (uint64_t)triu.data() +
+                                   static_cast<uint64_t>(sub_col) * static_cast<uint64_t>(Cube_S1) * sizeof(half));
+            TLOAD(qkHalfSub, qkLoadGlobal);
         }
         if (row_slice == static_cast<int>(kTileFactor) - 1) {
             TFREE<QKPipe, QKVecSlotGlobal, TileSplitAxis::TILE_UP_DOWN>(qkPipe, qkVecSlotGlobal);
@@ -486,6 +491,13 @@ AICORE inline void compute_p(QKPipe &qkPipe, PPipe &pPipe, int tile_id, int row_
 
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+
+        // Widen the staged fp16 scores (in triu) into the fp32 qkVecTile the softmax consumes. The
+        // barrier orders this read of triu before the causal mask (softmax) rewrites triu from causal_e.
+        TileDataH_T triuAsHalf;
+        TASSIGN(triuAsHalf, (uint64_t)triu.data());
+        TCVT(qkVecTile, triuAsHalf, RoundMode::CAST_ROUND);
+        pipe_barrier(PIPE_V);
 
         // Extract per-slice views into the per-core reduce tiles so each slice writes into its row range
         using ReduceSliceTile = Tile<TileType::Vec, float, Vec_S0, 1, BLayout::ColMajor, Vec_S0, 1>;
@@ -755,18 +767,24 @@ AICORE inline void runTFAImpl(uint32_t S0, uint32_t S1, uint32_t qk_preload, uin
         // Build E in fp32 (scalar half ops are illegal on aicore) in the triu scratch, then cast to
         // fp16 once. triu is free here (only used during the work loop). Row 0 = [0,-1,-2,...] via a
         // descending fp32 TCI; row i = row 0 + i.
+        // Build E in the qkVecTile[0] scratch (free at startup) rather than triu: compute_p now stages
+        // the fp16 QK scores through triu, so keeping E out of triu removes any coupling with it.
+        const uint64_t e_scratch = (uint64_t)qkVecTile[0].data();
         using ERowF = Tile<TileType::Vec, float, 1, Tile_S1, BLayout::RowMajor, 1, Tile_S1>;
+        using EBlockF = Tile<TileType::Vec, float, Vec_S0, Tile_S1, BLayout::RowMajor, Vec_S0, Tile_S1>;
         ERowF e_row0;
-        TASSIGN(e_row0, (uint64_t)triu.data());
+        TASSIGN(e_row0, e_scratch);
         TCI<ERowF, float, 1>(e_row0, 0.0f); // e_row0[j] = 0 - j
         pipe_barrier(PIPE_V);
         for (int i = 1; i < static_cast<int>(Vec_S0); ++i) {
             ERowF e_rowi;
-            TASSIGN(e_rowi, (uint64_t)triu.data() + static_cast<uint64_t>(i) * Tile_S1 * sizeof(float));
+            TASSIGN(e_rowi, e_scratch + static_cast<uint64_t>(i) * Tile_S1 * sizeof(float));
             TADDS(e_rowi, e_row0, static_cast<float>(i)); // e_rowi[j] = i - j
         }
         pipe_barrier(PIPE_V);
-        TCVT(causal_e, triu, RoundMode::CAST_ROUND); // fp32 E -> fp16 causal_e
+        EBlockF e_block;
+        TASSIGN(e_block, e_scratch);
+        TCVT(causal_e, e_block, RoundMode::CAST_ROUND); // fp32 E -> fp16 causal_e
         pipe_barrier(PIPE_V);
     }
 
@@ -812,6 +830,10 @@ AICORE inline void runTFAImpl(uint32_t S0, uint32_t S1, uint32_t qk_preload, uin
     __gm__ half *p_tile_fifo_block = p_tile_fifo + static_cast<size_t>(comm_slot) * p_fifo_block_stride;
     __gm__ float *exp_max_ififo_block = exp_max_ififo + static_cast<size_t>(comm_slot) * p_max_fifo_block_stride;
     __gm__ float *qk_tile_fifo_block = qk_tile_fifo + static_cast<size_t>(comm_slot) * qk_fifo_block_stride;
+    // QK scores are passed cube->vec as fp16 (half the fixpipe writeback + GM traffic; see compute_qk /
+    // compute_p). The cross-core pipe below is sync-only and keeps its float-sized slots; only the data
+    // read/written into this buffer is fp16, so it uses <= half of each slot. Same base, reinterpreted.
+    __gm__ half *qk_tile_fifo_block_h = reinterpret_cast<__gm__ half *>(qk_tile_fifo_block);
     __gm__ float *pv_tile_fifo_block = pv_tile_fifo + static_cast<size_t>(comm_slot) * pv_fifo_block_stride;
 
     int p_gu_src_pingpong_id = 0; // shared ping-pong for softmax vec tiles, pv output tiles, and GU input tiles
@@ -991,7 +1013,7 @@ AICORE inline void runTFAImpl(uint32_t S0, uint32_t S1, uint32_t qk_preload, uin
                 qkAccTileEvtID = assign_running_acc_tile(qkAccTile);
                 compute_qk<QKPipe, HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, CV_FIFO_CONS_SYNC_PERIOD,
                            INTERMEDIATE_CHECK, CAUSAL_MASK>(
-                    qkPipe, preload_tile, sub_tile, q_block, k_head, qk_tile_fifo_block, qMatTile[0],
+                    qkPipe, preload_tile, sub_tile, q_block, k_head, qk_tile_fifo_block_h, qMatTile[0],
                     kMatTile[k_src_pingpong_id % kMatTNBuffers], qkAccTile, qkSlotGlobal,
                     k_src_pingpong_id % kMatTNBuffers, qkAccTileEvtID, logical_block, q_seq_stride, kv_seq_stride);
                 k_src_pingpong_id++;
@@ -1002,7 +1024,7 @@ AICORE inline void runTFAImpl(uint32_t S0, uint32_t S1, uint32_t qk_preload, uin
                 // Init only on the very first S1 tile; row_slice partitions rows within that tile
                 compute_p<QKPipe, PPipe, HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, CV_FIFO_CONS_SYNC_PERIOD,
                           INTERMEDIATE_CHECK, CAUSAL_MASK>(
-                    qkPipe, pPipe, preload_tile, row_slice, exp_max_ififo_block, qk_tile_fifo_block, p_tile_fifo_block,
+                    qkPipe, pPipe, preload_tile, row_slice, exp_max_ififo_block, qk_tile_fifo_block_h, p_tile_fifo_block,
                     global_sum_block, exp_max_block, qkVecTile[p_gu_src_pingpong_id % srcVecTNBuffers],
                     x_expT[p_gu_src_pingpong_id % xexpVecTNBuffers], input_reduce_tmp, m1_local_max, l1_local_sum,
                     m2_global_max, l2_global_sum, l1_exp_max_ififo[preload_tile % qkp_tile_fifo_size], triu, causal_e,
@@ -1026,7 +1048,7 @@ AICORE inline void runTFAImpl(uint32_t S0, uint32_t S1, uint32_t qk_preload, uin
                 if (next_qk_tile != -1) {
                     compute_qk<QKPipe, HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, CV_FIFO_CONS_SYNC_PERIOD,
                                INTERMEDIATE_CHECK, CAUSAL_MASK>(
-                        qkPipe, next_qk_tile, sub_tile, q_block, k_head, qk_tile_fifo_block, qMatTile[0],
+                        qkPipe, next_qk_tile, sub_tile, q_block, k_head, qk_tile_fifo_block_h, qMatTile[0],
                         kMatTile[k_src_pingpong_id % kMatTNBuffers], qkAccTile, qkSlotGlobal,
                         k_src_pingpong_id % kMatTNBuffers, qkAccTileEvtID, logical_block, q_seq_stride, kv_seq_stride);
                     k_src_pingpong_id++;
@@ -1037,7 +1059,7 @@ AICORE inline void runTFAImpl(uint32_t S0, uint32_t S1, uint32_t qk_preload, uin
                 if (next_qk_tile != -1) {
                     compute_p<QKPipe, PPipe, HEAD_SIZE, CUBE_S0, CUBE_S1, Tile_S1, CV_FIFO_CONS_SYNC_PERIOD,
                               INTERMEDIATE_CHECK, CAUSAL_MASK>(
-                        qkPipe, pPipe, next_qk_tile, sub_tile, exp_max_ififo_block, qk_tile_fifo_block,
+                        qkPipe, pPipe, next_qk_tile, sub_tile, exp_max_ififo_block, qk_tile_fifo_block_h,
                         p_tile_fifo_block, global_sum_block, exp_max_block,
                         qkVecTile[p_gu_src_pingpong_id % srcVecTNBuffers],
                         x_expT[p_gu_src_pingpong_id % xexpVecTNBuffers], input_reduce_tmp, m1_local_max, l1_local_sum,
