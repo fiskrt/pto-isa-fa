@@ -119,10 +119,6 @@ def benchmark_one(variants, S0, S1, causal, batch=1, num_q_heads=1, num_kv_heads
     q = (torch.randn(batch, num_q_heads, S0, HEAD, device=dev) * 0.1).to(torch.float16)
     k = (torch.randn(batch, num_kv_heads, S1, HEAD, device=dev) * 0.1).to(torch.float16)
     v = (torch.randn(batch, num_kv_heads, S1, HEAD, device=dev) * 0.1).to(torch.float16)
-    # The kernel reads K transposed (DN layout), i.e. each head as [HEAD, S1]. Feed it that way:
-    # [B, Nkv, HEAD, S1] contiguous. Per head this is exactly the old kt = K.t(); heads are stacked
-    # with stride HEAD*S1 == S1*HEAD, which is what the launcher's kv_head_stride expects.
-    k_kernel = k.transpose(2, 3).contiguous()
 
     atol = CAUSAL_ATOL if causal else ATOL
 
@@ -153,7 +149,7 @@ def benchmark_one(variants, S0, S1, causal, batch=1, num_q_heads=1, num_kv_heads
 
         def run(kernel=kernel, o=o, workspace=workspace, qk_preload=qk_preload):
             stream = torch.npu.current_stream().npu_stream
-            return kernel.run(q.data_ptr(), k_kernel.data_ptr(), v.data_ptr(), o.data_ptr(),
+            return kernel.run(q.data_ptr(), k.data_ptr(), v.data_ptr(), o.data_ptr(),
                               workspace.data_ptr(), stream, S0, S1, batch, num_q_heads, num_kv_heads,
                               causal, qk_preload)
 
